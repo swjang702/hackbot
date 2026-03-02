@@ -243,9 +243,9 @@ Bot scripts / LLM brain    -->  LLM Brain (hackbot agent logic)
 ```
 
 The key architectural insight from rs-sdk is the **separation between the world being observed and the visualization of that world**. In rs-sdk, the game engine runs independently; the web client renders a view; the bot interacts through a defined SDK. In hackbot:
-- The kernel runs independently (it is the "game engine")
-- The visualization renders a view of kernel state (derived from eBPF data)
-- The agent interacts through system call and eBPF interfaces
+- _The kernel runs independently (it is the "game engine")_
+- _The visualization renders a view of kernel state (derived from eBPF data)_
+- _The agent interacts through system call and eBPF interfaces_
 
 ### MVP Visualization: What to Build First
 
