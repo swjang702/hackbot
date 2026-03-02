@@ -74,13 +74,13 @@ The blog post identifies a four-stage research cycle that maps to the handwritte
 
 ## 3. Key Research Connections Identified
 
-### 3.1 Security Angle: Side-Channel Attacks on LLM Infrastructure
+### 3.1 Security Angle: ~~Side-Channel Attacks on LLM Infrastructure~~
 
 The power and event traces collected for performance analysis are simultaneously **side-channel attack vectors**. Research question: Can an attacker on a shared heterogeneous system infer sensitive information about an LLM workload (conversation topic, prompt length, specific tokens) by monitoring power, cache, and memory bandwidth via eBPF? The defense is **isolation** -- and measuring its effectiveness ties back to the PhD goal.
 
-### 3.2 Systems Angle: Provable Abstractions for Accelerators
+### 3.2 Systems Angle: ~~Provable Abstractions for Accelerators~~
 
-Current OS abstractions for GPUs/TPUs are primitive character devices hiding immense complexity. Tracing work gathers the empirical data needed to design new, cleaner, formally verifiable abstractions. This aligns with Prof. Burtsev's philosophy of "design philosophy where careful system design can make strong guarantees more practical."
+Current OS abstractions for GPUs/TPUs are primitive character devices hiding immense complexity. Tracing work gathers the empirical data needed to design new, cleaner, formally verifiable abstractions. This aligns with ~~Prof. Burtsev's philosophy~~ of "design philosophy where careful system design can make strong guarantees more practical."
 
 ### 3.3 Tracing as Function Understanding
 
@@ -92,7 +92,7 @@ A bridging concept: using eBPF to prove where security guarantees break when acc
 
 ---
 
-## 4. The Handwritten Architecture Diagram (mynote.jpg)
+<!-- ## 4. The Handwritten Architecture Diagram (mynote.jpg) -->
 
 The diagram (also embedded in the Research Statement PDF as "Figure 1: My rough note about the architecture") shows the following flow:
 
