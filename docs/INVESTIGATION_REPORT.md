@@ -166,7 +166,7 @@ The rs-sdk architecture provides the most direct template:
 4. **Complex plane integration**: Could start as a secondary dashboard view alongside the game view, showing signal analysis of the trace data.
 
 ---
-
+`[Skip]`
 ## 7. Connections Between All Documents
 
 The documents form a coherent narrative:
@@ -189,7 +189,7 @@ The project name "hackbot" itself encodes the vision: a bot that hacks (explores
 | **Gamification of kernel exploration** | System internals rendered as a game world the agent navigates |
 | **Complex plane mapping** | Traces converted to complex signals; anomalies appear as phase shifts |
 | **Auto-hunting** | Autonomous 24/7 vulnerability discovery, like bitcoin mining but for security bugs |
-| **Side-channel as research bridge** | Power/event profiling data is both performance insight and attack vector |
+| ~~**Side-channel as research bridge**~~ | Power/event profiling data is both performance insight and attack vector |
 | **Provable abstractions** | Ultimate goal: redesign system layers with formal guarantees, informed by empirical tracing |
 | **Observe-Model-Redesign-Quantify** | The research cycle from empirical data to verified system design |
 | **Opaque workload isolation** | Privacy-preserving abstraction for workloads (LLMs) whose internals must stay hidden |
