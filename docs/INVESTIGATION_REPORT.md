@@ -91,8 +91,8 @@ The note "tracing: x -> function -> y. The art of figuring out the function" cap
 A bridging concept: using eBPF to prove where security guarantees break when accelerator resources are shared, then building verified microkernel designs to defend those boundaries. Combined with **Opaque Workload Isolation** -- building "Privacy-Preserving Abstraction" at the system level for workloads like LLMs whose internals must not be visible.
 
 ---
-
-<!-- ## 4. The Handwritten Architecture Diagram (mynote.jpg) -->
+`[Skip]`
+## 4. The Handwritten Architecture Diagram (mynote.jpg)
 
 The diagram (also embedded in the Research Statement PDF as "Figure 1: My rough note about the architecture") shows the following flow:
 
