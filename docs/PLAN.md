@@ -441,6 +441,7 @@ hackbot/
 **Trade-off**: May not reveal inter-process communication patterns as clearly as a force-directed layout where communicating processes are pulled closer together. Can be upgraded to force-directed layout as an option in a later phase.
 
 ### Concern 1: Verus for formal verification and What about leveraging WASM?
+### Concern 2: in-kernel LLM?
 
 ---
 

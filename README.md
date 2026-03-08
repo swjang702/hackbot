@@ -72,3 +72,8 @@ context7 (library docs), puppeteer (browser testing), sequential-thinking (reaso
 ## Research Context
 
 Read `docs/refs/Research_Statement.pdf` and `docs/refs/Connecting the dots...pdf` for the research vision. The four pillars: (1) autonomous kernel bot, (2) visualization as gameplay, (3) complex plane anomaly detection, (4) mathematical self-improvement. The MVP covers pillars 1-2 (visualization) with early pillar 3 (complex plane).
+
+## Research Ideas
+- Verus for formal verification
+- in-kernel LLM
+- What about leveraging WASM?
