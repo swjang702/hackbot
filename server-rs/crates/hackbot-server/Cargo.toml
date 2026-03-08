@@ -1,0 +1,17 @@
+[package]
+name = "hackbot-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hackbot-types = { path = "../hackbot-types" }
+axum = { version = "0.8", features = ["ws"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["cors"] }
+rand = { version = "0.8", features = ["std_rng"] }
+futures-util = "0.3"
+thiserror = "2"

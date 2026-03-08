@@ -1,0 +1,6 @@
+.claude
+.mcp.json
+CLAUDE.md
+node_modules/
+target/
+dist/

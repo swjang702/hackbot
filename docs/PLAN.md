@@ -1,8 +1,8 @@
 # hackbot Implementation Plan
 
-**Date**: 2026-03-02
-**Status**: Pre-implementation (no source code exists yet)
-**Guiding Principle**: Visualization-first MVP
+**Date**: 2026-03-02 (updated 2026-03-08)
+**Status**: Phase 1 complete (Python), rewriting backend to Rust
+**Guiding Principle**: Visualization-first MVP, Rust backend for Verus alignment
 
 ---
 
@@ -165,25 +165,37 @@ The schema is extensible: new event types can be added without breaking existing
 
 | Component | Technology | Justification |
 |-----------|-----------|---------------|
-| **Frontend framework** | TypeScript + Vite | Type safety for complex visualization code. Vite for fast dev iteration. Matches rs-sdk's TypeScript approach. |
-| **2D rendering** | Pixi.js v8 | WebGL-accelerated sprite-based 2D renderer. Ideal for game-like visuals (process rooms, event particles, agent character). Large community, well-documented. Not a full game engine (avoids unnecessary complexity). |
-| **Signal view rendering** | HTML5 Canvas 2D API | The complex plane plot and phase diagram are mathematical charts, not game objects. Raw Canvas is simpler and more appropriate than Pixi.js for this. |
-| **Backend framework** | Python 3.12 + FastAPI | FastAPI has native WebSocket support and async. Python aligns with eBPF ecosystem (bcc, bpftrace). Sunwoo's professional toolchain is C/Python. |
-| **Signal processing** | numpy + scipy | Complex plane computation (FFT, windowing, phase extraction) requires numerical libraries. Python's scientific stack is unmatched here. |
-| **Data serialization** | JSON (messages), JSON Lines (trace files) | Human-readable for MVP debugging. Can migrate to MessagePack or Protobuf for performance later. |
-| **Package management** | uv (Python), pnpm (TypeScript) | uv is fast and modern for Python. pnpm is efficient for node_modules. |
-| **Dev tooling** | Ruff (Python linting), ESLint + Prettier (TypeScript) | Standard tooling for each language. |
+| **Frontend framework** | TypeScript + Vite | Type safety for complex visualization code. Vite for fast dev iteration. |
+| **2D rendering** | Pixi.js v8 | WebGL-accelerated sprite-based 2D renderer. Ideal for game-like visuals (process rooms, event particles, agent character). |
+| **Signal view rendering** | HTML5 Canvas 2D API | The complex plane plot and phase diagram are mathematical charts, not game objects. Raw Canvas is simpler. |
+| **Backend framework** | Rust + Axum + Tokio | High-performance async WebSocket server. Aligns with Verus formal verification goals (Pillar 4). Single binary deployment. Native eBPF support via `aya` (Phase 3). |
+| **Signal processing** | ndarray + rustfft | Rust-native numerical computing for complex plane computation. Research prototyping done in Python/Jupyter notebooks, production code in Rust. |
+| **Data serialization** | serde + serde_json, JSON Lines (trace files) | Zero-copy deserialization. Human-readable for debugging. |
+| **Package management** | Cargo (Rust), pnpm (TypeScript) | Cargo workspace for multi-crate backend. pnpm for frontend. |
+| **Dev tooling** | clippy + rustfmt (Rust), ESLint + Prettier (TypeScript) | Standard tooling for each language. |
+
+### Why Rust over Python (Decision Record, 2026-03-08)
+
+The initial Phase 1 prototype used Python/FastAPI. The decision to rewrite in Rust is driven by:
+
+1. **Verus alignment**: Research Pillar 4 targets formally verified system abstractions. Verus verifies Rust code. Writing in Python means rewriting for verification later under deadline pressure.
+2. **eBPF native path**: Phase 3 uses `aya` — kernel-side eBPF programs and userspace loader both in Rust. No C/Python boundary.
+3. **Small rewrite cost**: The Python backend is ~850 lines. Porting now costs 1-2 days. At Phase 3 it would be 3000+ lines.
+4. **Single binary deployment**: `cargo build --release` produces one static binary. No Python environment management on research machines.
+5. **Performance headroom**: Live eBPF streaming (Phase 3) at millions of events/sec would stress Python. Rust handles this natively.
+
+The frontend remains TypeScript — Rust/WASM for UI has no advantage over the TypeScript ecosystem.
 
 ### Technologies Explicitly NOT Chosen
 
 | Rejected | Reason |
 |----------|--------|
+| Python/FastAPI | Initial prototype language. Replaced by Rust for Verus alignment and eBPF native support. |
 | Three.js / WebGL direct | Overkill for 2D visualization. Pixi.js abstracts WebGL for 2D use cases. |
-| Phaser / Godot (web) | Full game engines with opinions about game loops, physics, etc. Too heavyweight for a visualization tool. |
-| Grafana / existing dashboards | Chart-based, not spatial/world-based. Cannot render the game-like experience that is the project's core differentiator. |
-| All-TypeScript backend | Loses access to numpy/scipy for signal processing. Sunwoo's eBPF toolchain is Python-native. |
-| Electron | Unnecessary for MVP. Browser-based is simpler and more portable. |
-| React/Vue/Svelte | The visualization is Canvas/WebGL-based, not DOM-based. A UI framework adds indirection without benefit for the core rendering. Simple HTML + TypeScript modules suffice. |
+| Phaser / Godot (web) | Full game engines. Too heavyweight for a visualization tool. |
+| Grafana / existing dashboards | Chart-based, not spatial/world-based. Cannot render the game-like experience. |
+| Go backend | Good for eBPF (cilium/ebpf) but lacks Verus-equivalent formal verification tooling. |
+| React/Vue/Svelte | The visualization is Canvas/WebGL-based, not DOM-based. Simple HTML + TypeScript modules suffice. |
 
 ---
 
@@ -192,25 +204,39 @@ The schema is extensible: new event types can be added without breaking existing
 ```
 hackbot/
   docs/                              # [EXISTS] Research documents
-    Research_Statement.pdf
-    Connecting the dots...pdf
-    mynote.jpg
-    refs.md
+    PLAN.md                          # This file
+    ARCHITECTURE.md                  # System architecture diagrams
+    refs/
+      Research_Statement.pdf
+      Connecting the dots...pdf
+      mynote.jpg
+      refs.md
 
-  server/                            # Python backend (FastAPI)
-    pyproject.toml                   # Project config (uv)
-    server/
-      __init__.py
-      main.py                       # FastAPI app, WebSocket endpoint, startup
-      gateway.py                    # WebSocket connection manager, message routing
-      trace_loader.py               # Parse .jsonl trace files, validate schema
-      trace_replayer.py             # Replay events at original timing with speed control
-      world_model.py                # Maintain process map, fd table, connection graph
-      signal_processor.py           # Windowing, feature extraction, complex plane mapping
-      schemas.py                    # Pydantic models for events and WebSocket messages
-      mock_data.py                  # Generate realistic mock trace data
+  server/                            # [DEPRECATED] Python backend (kept for reference)
 
-  frontend/                          # TypeScript + Vite + Pixi.js
+  server-rs/                         # Rust backend (Axum + Tokio)
+    Cargo.toml                       # Workspace root
+    crates/
+      hackbot-types/                 # Shared types (TraceEvent, WorldState, WS messages)
+        Cargo.toml
+        src/lib.rs
+      hackbot-server/                # Main binary (axum, gateway, replayer, loader)
+        Cargo.toml
+        src/
+          main.rs                    # Axum app, routes, startup
+          gateway.rs                 # WebSocket handler, message routing
+          trace_loader.rs            # Parse .jsonl trace files, validate schema
+          trace_replayer.rs          # Async replay with tokio timing + speed control
+          world_model.rs             # Maintain process map, fd table, connections
+          mock_data.rs               # Generate realistic mock trace data
+      hackbot-signal/                # [Phase 2] Signal processor (complex plane)
+        Cargo.toml
+        src/lib.rs
+      hackbot-ebpf/                  # [Phase 3] eBPF programs + loader (aya)
+        Cargo.toml
+        src/lib.rs
+
+  frontend/                          # TypeScript + Vite + Pixi.js [UNCHANGED]
     package.json
     tsconfig.json
     vite.config.ts
@@ -219,27 +245,27 @@ hackbot/
       main.ts                       # Entry point, initialize app
       app.ts                        # Orchestrator: connects panels, manages state
       connection.ts                 # WebSocket client with reconnect logic
-      types.ts                      # TypeScript types (mirrors server schemas.py)
+      types.ts                      # TypeScript types (mirrors hackbot-types)
       game/
         world.ts                    # Pixi.js Application + stage management
-        process-room.ts             # Render process as labeled rectangle with activity indicator
-        syscall-object.ts           # Animated event within a process room (flash + fade)
-        event-particle.ts           # Particle effect for high-frequency event bursts
+        process-room.ts             # Render process as labeled rectangle
+        syscall-object.ts           # Animated event within a process room
+        event-particle.ts           # Particle effect for high-frequency bursts
         camera.ts                   # Pan (drag) + zoom (scroll) controls
-        spatial-mapper.ts           # Assign 2D coordinates to processes (grid/tree layout)
-      signal/
-        complex-plane.ts            # Render z(t) orbit on complex plane with trail
-        phase-diagram.ts            # Render theta(t) as time-series line chart
-        anomaly-marker.ts           # Visual pulse/highlight when deviation > threshold
+        spatial-mapper.ts           # Tree layout for processes
+      signal/                       # [Phase 2]
+        complex-plane.ts
+        phase-diagram.ts
+        anomaly-marker.ts
       ui/
-        timeline.ts                 # Playback bar: play/pause/speed buttons, scrub slider
-        event-log.ts                # Scrollable list of events with type/PID filtering
-        controls.ts                 # Filter dropdowns, settings toggles
-        layout.ts                   # CSS Grid-based panel layout manager
+        timeline.ts                 # Playback bar with scrub slider
+        event-log.ts                # Scrollable event list
+        controls.ts                 # PID and type filter chips
+        layout.ts                   # CSS Grid panel layout
 
   traces/                            # Sample trace data for development
-    sample-llm-workload.jsonl       # Mock LLM inference trace (prefill + decode phases)
-    format.md                       # Trace format specification document
+    sample-llm-workload.jsonl       # Mock LLM inference trace
+    format.md                       # Trace format specification
 ```
 
 ---
@@ -252,18 +278,18 @@ hackbot/
 
 **Duration estimate**: 2-3 weeks
 
-#### Phase 1A: Backend Foundation
+#### Phase 1A: Backend Foundation (Rust)
 
 | Task | File(s) | Description |
 |------|---------|-------------|
-| 1A.1 | `server/pyproject.toml` | Initialize Python project with uv. Dependencies: fastapi, uvicorn, websockets, pydantic, numpy. |
-| 1A.2 | `server/server/schemas.py` | Define Pydantic models: `TraceEvent` (with discriminated union for payload types), `WorldState`, `ProcessInfo`, `WebSocketMessage` (server->client), `WebSocketCommand` (client->server). |
-| 1A.3 | `server/server/mock_data.py` | Write a generator that creates a realistic LLM workload trace: parent Python process forks workers, workers issue GPU submits, read/write syscalls, scheduling events. Output as .jsonl file. Include power trace events that correlate with GPU activity. Generate ~10,000 events spanning ~5 seconds of wall time. |
-| 1A.4 | `server/server/trace_loader.py` | Load a .jsonl file, parse each line into `TraceEvent` objects, validate schema, sort by timestamp. Support streaming (yield events) for large files. |
-| 1A.5 | `server/server/world_model.py` | Consume events and maintain state: dict of active processes (pid -> ProcessInfo with name, parent_pid, status, syscall_counts), dict of file descriptors (pid,fd -> type/target), list of inter-process connections (pipes, sockets). Expose `get_world_state()` method that returns snapshot. |
-| 1A.6 | `server/server/trace_replayer.py` | Async generator that yields events at their original relative timing. Support `play()`, `pause()`, `seek(ts)`, `set_speed(multiplier)`. Use asyncio sleep between events, adjusted by speed multiplier. Batch events that are within 16ms of each other (one frame at 60fps) to avoid overwhelming the client. |
-| 1A.7 | `server/server/gateway.py` | WebSocket connection manager. On connect: send initial `world_state`. During playback: send `events` batches and periodic `world_state` updates (every 500ms). Handle incoming commands (play/pause/seek/speed/filter). |
-| 1A.8 | `server/server/main.py` | FastAPI app. Routes: `GET /` serves info, `GET /traces` lists available trace files, `WS /ws` WebSocket endpoint delegating to gateway. On startup: load default trace file. |
+| 1A.1 | `server-rs/Cargo.toml`, `crates/*/Cargo.toml` | Initialize Cargo workspace. Dependencies: axum, tokio, serde, serde_json, tower-http (CORS), rand, tracing. |
+| 1A.2 | `crates/hackbot-types/src/lib.rs` | Define types with serde: `TraceEvent` (with `#[serde(tag = "type")]` for payload discrimination), `EventType` enum, payload structs, `WorldState`, `ProcessInfo`, WS message enums. Timestamps as `u64` internally, serialized as strings for JS BigInt safety. |
+| 1A.3 | `crates/hackbot-server/src/mock_data.rs` | Port mock trace generator. Same narrative (startup→prefill→decode→anomaly→recovery), same seed (42), same event counts. Output compatible .jsonl. |
+| 1A.4 | `crates/hackbot-server/src/trace_loader.rs` | Load .jsonl file line-by-line with `serde_json::from_str`. Validate payloads, sort by timestamp. Stream with iterator for large files. |
+| 1A.5 | `crates/hackbot-server/src/world_model.rs` | HashMap-based process map, fd table, connections. Event handler dispatch via match on EventType. `rebuild_to()` for seek. |
+| 1A.6 | `crates/hackbot-server/src/trace_replayer.rs` | Async state machine with `tokio::time::sleep`. Play/pause via `tokio::sync::Notify`, seek via atomic position update. 16ms batch window. Speed multiplier. Filter by PID/type. |
+| 1A.7 | `crates/hackbot-server/src/gateway.rs` | Axum WebSocket handler. `tokio::sync::broadcast` for fan-out to clients. Command parsing from JSON. Playback loop as spawned task. World state updates every 500ms. |
+| 1A.8 | `crates/hackbot-server/src/main.rs` | Axum router: `GET /` info, `GET /traces` list files, `WS /ws` upgrade. CORS via tower-http. Auto-load default trace on startup. Serve on port 8000. |
 
 #### Phase 1B: Frontend Foundation
 
@@ -382,13 +408,13 @@ hackbot/
 
 **Trade-off**: Delays the real-time "living system" experience. Acceptable because the visualization concepts (spatial mapping, complex plane) can be fully validated with replay data.
 
-### Decision 3: Python Backend (not all-TypeScript)
+### Decision 3: Rust Backend (not Python or all-TypeScript)
 
-**Choice**: Python (FastAPI) for the server, TypeScript for the frontend.
+**Choice**: Rust (Axum + Tokio) for the server, TypeScript for the frontend.
 
-**Rationale**: (a) numpy/scipy for signal processing has no TypeScript equivalent of comparable quality. (b) The eBPF ecosystem (bcc, bpftrace, libbpf bindings) is Python-native. (c) Sunwoo's professional toolchain is C/Python. (d) FastAPI provides excellent async WebSocket support. Using the same language for both sides (like rs-sdk's all-TypeScript) would mean either giving up scientific computing libraries or adding a Python sidecar anyway.
+**Rationale**: (a) Verus formal verification (Pillar 4) requires Rust code — writing Python now means rewriting for verification later. (b) Phase 3 eBPF uses `aya` — kernel and userspace both in Rust, no C/Python boundary. (c) Single static binary deployment simplifies running on research machines. (d) Performance headroom for live eBPF streaming at millions of events/sec (Phase 3). (e) End-to-end memory safety from kernel probe to API server.
 
-**Trade-off**: Two languages in the project. Mitigated by having a clean JSON WebSocket boundary between them -- the server and client can be developed independently.
+**Trade-off**: Slower initial development vs Python. Mitigated by: (1) the Python prototype already validated the architecture, (2) Rust's serde provides equivalent serialization ergonomics to Pydantic, (3) signal processing research prototyping done in Jupyter notebooks, production code ported to ndarray.
 
 ### Decision 4: Pixi.js (not raw Canvas, not full game engine)
 
@@ -413,6 +439,8 @@ hackbot/
 **Rationale**: Simple, deterministic, and aligns with how users mentally model process hierarchies (similar to `pstree` output). Force-directed layouts look prettier but are non-deterministic (different runs produce different layouts) and expensive to compute for large process trees.
 
 **Trade-off**: May not reveal inter-process communication patterns as clearly as a force-directed layout where communicating processes are pulled closer together. Can be upgraded to force-directed layout as an option in a later phase.
+
+### Concern 1: Verus for formal verification and What about leveraging WASM?
 
 ---
 
