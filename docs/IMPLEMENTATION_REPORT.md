@@ -168,8 +168,18 @@ ssh -L 5173:localhost:5173 -L 8000:localhost:8000 fedora
 
 ---
 
-## Next: Phase 2 — Complex Plane Signal View
+## Next Steps
 
+### Phase 2 — Complex Plane Signal View
 - `hackbot-signal` crate: sliding window, feature extraction, z(t) = r(t) * exp(i * theta(t))
 - Frontend: Canvas 2D orbit plot + phase diagram panel
 - Anomaly detection: EMA + standard deviation threshold
+
+### In-Kernel LLM (Research Exploration)
+- Feasibility analysis completed (see `docs/PLAN.md` Appendix B + C)
+- Prior art: KLLM (GPT-2 124M kernel module), eBPF+ML research, kernel-wasm runtimes
+- Key constraints: FPU preemption, no math libraries in kernel, GB-scale vmalloc
+- **Hybrid architecture decided**: eBPF = eyes/ears (observation, reuse existing tracer), Rust kernel module = brain (LLM inference)
+- **Action safety via BPF verifier**: LLM generates eBPF programs as actions, kernel verifier proves safety before execution
+- Plan: Start with tiny model (~1-10M params), INT8 inference, Rust kernel module, /dev/hackbot interface
+- Vision: Kernel as 3D game world with two modes (Explorer/Tourism + Hacker/Security), real-time LLM chat interface

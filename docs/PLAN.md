@@ -339,20 +339,21 @@ hackbot/
 
 ---
 
-### Phase 3: Real-time Streaming
+### Phase 3: Real-time eBPF Streaming
 
-**Goal**: Connect to a live eBPF data source instead of replaying files.
+**Goal**: Connect to a live eBPF data source instead of replaying files. Uses `aya` for native Rust eBPF.
 
 **Duration estimate**: 1-2 weeks
 
 | Task | File(s) | Description |
 |------|---------|-------------|
-| 3.1 | `server/server/event_ingestion.py` (new) | TCP or Unix domain socket server that receives events from an external eBPF collector process. Protocol: newline-delimited JSON (same schema as trace files). Parse and feed into the same pipeline as trace_replayer. |
-| 3.2 | `server/server/gateway.py` | Add mode switching: "replay" mode (from file) vs "live" mode (from ingestion). In live mode, events are forwarded immediately (no timing replay needed). |
-| 3.3 | `server/server/world_model.py` | Ensure world model handles events arriving out of order (possible with live data from multiple CPUs). Use timestamp for ordering within a small reorder buffer (e.g., 10ms). |
-| 3.4 | `server/server/signal_processor.py` | Ensure streaming computation works: sliding window advances in real time, not trace time. |
-| 3.5 | `frontend/src/connection.ts` | Add UI indicator for connection mode (replay vs live). In live mode, hide scrub bar; show only pause/resume and speed controls. |
-| 3.6 | `server/server/main.py` | Add CLI flag or API endpoint to switch between replay and live mode. |
+| 3.1 | `crates/hackbot-ebpf/src/lib.rs` (new crate) | eBPF programs using `aya`: kprobes for syscall entry/exit, tracepoints for sched_switch, perf events for power. Compiles to BPF bytecode via `aya-bpf`. Userspace loader in the same crate reads from BPF ring buffer and emits `TraceEvent`s. |
+| 3.2 | `crates/hackbot-server/src/event_ingestion.rs` (new) | Receives events from `hackbot-ebpf` ring buffer (in-process) or from an external collector via Unix domain socket (newline-delimited JSON). Feeds into the same pipeline as trace_replayer. |
+| 3.3 | `crates/hackbot-server/src/gateway.rs` | Add mode switching: "replay" mode (from file) vs "live" mode (from ingestion). In live mode, events are forwarded immediately (no timing replay needed). |
+| 3.4 | `crates/hackbot-server/src/world_model.rs` | Ensure world model handles events arriving out of order (possible with live data from multiple CPUs). Use timestamp for ordering within a small reorder buffer (e.g., 10ms). |
+| 3.5 | `crates/hackbot-signal/src/lib.rs` | Ensure streaming computation works: sliding window advances in real time, not trace time. |
+| 3.6 | `frontend/src/connection.ts` | Add UI indicator for connection mode (replay vs live). In live mode, hide scrub bar; show only pause/resume and speed controls. |
+| 3.7 | `crates/hackbot-server/src/main.rs` | Add CLI flag `--live` to switch between replay and live mode. |
 
 ---
 
@@ -364,11 +365,11 @@ hackbot/
 
 | Task | File(s) | Description |
 |------|---------|-------------|
-| 4.1 | `frontend/src/game/agent-character.ts` | Pixi.js sprite/graphic representing the agent. A small animated icon (e.g., a glowing dot with a directional indicator) that smoothly moves between process rooms. Has a "field of view" visual (semi-transparent circle showing the agent's current observation area). |
-| 4.2 | `server/server/agent_state.py` (new) | Agent state model: current_position (pid of process being examined), attention_area (list of pids being monitored), action_history (recent actions taken), capabilities (available actions). |
+| 4.1 | `frontend/src/game/agent-character.ts` (new) | Pixi.js sprite/graphic representing the agent. A small animated icon (e.g., a glowing dot with a directional indicator) that smoothly moves between process rooms. Has a "field of view" visual (semi-transparent circle showing the agent's current observation area). |
+| 4.2 | `crates/hackbot-server/src/agent_state.rs` (new) | Agent state model: current_position (pid of process being examined), attention_area (list of pids being monitored), action_history (recent actions taken), capabilities (available actions). Shared types go in `hackbot-types`. |
 | 4.3 | `frontend/src/game/world.ts` | Add click handler on process rooms. Clicking a room sends `agent_move` command to server. Agent character smoothly animates to the clicked room. |
 | 4.4 | `frontend/src/ui/agent-panel.ts` (new) | Side panel showing agent's current state: which process it is examining, what events it sees, suggested next actions (hardcoded heuristics for now, LLM-driven in Phase 5). |
-| 4.5 | `server/server/gateway.py` | Handle `agent_move` commands. Update agent state. Send `agent_state` messages to client with position, attention area, and any observations. |
+| 4.5 | `crates/hackbot-server/src/gateway.rs` | Handle `agent_move` commands. Update agent state. Send `agent_state` messages to client with position, attention area, and any observations. |
 
 ---
 
@@ -380,13 +381,13 @@ hackbot/
 
 | Task | File(s) | Description |
 |------|---------|-------------|
-| 5.1 | `server/server/agent_brain.py` (new) | OODA loop implementation. On each decision cycle (configurable interval, e.g., every 2 seconds): (a) **Observe**: summarize current system state from world_model (process list, recent event counts, anomaly flags). (b) **Orient**: include context from memory (previous findings, exploration history). (c) **Decide**: send summary to LLM API, receive action selection. (d) **Act**: execute the chosen action (move to process, enable new probe filter, flag anomaly). |
-| 5.2 | `server/server/llm_client.py` (new) | Async client for LLM API (support Anthropic Claude and OpenAI GPT). Takes system state summary string, available actions list, and returns selected action with reasoning. Configurable model, temperature, max tokens. |
-| 5.3 | `server/server/agent_state.py` | Extend with action types: `move_to(pid)`, `focus_on(event_type)`, `flag_anomaly(description)`, `adjust_filter(params)`. Each action has a defined effect on the world model / gateway filters. |
+| 5.1 | `crates/hackbot-server/src/agent_brain.rs` (new) | OODA loop implementation. On each decision cycle (configurable interval, e.g., every 2 seconds): (a) **Observe**: summarize current system state from world_model (process list, recent event counts, anomaly flags). (b) **Orient**: include context from memory (previous findings, exploration history). (c) **Decide**: send summary to LLM API, receive action selection. (d) **Act**: execute the chosen action (move to process, enable new probe filter, flag anomaly). |
+| 5.2 | `crates/hackbot-server/src/llm_client.rs` (new) | Async client for LLM API (support Anthropic Claude and OpenAI GPT). Uses `reqwest` for HTTP. Takes system state summary string, available actions list, and returns selected action with reasoning. Configurable model, temperature, max tokens. |
+| 5.3 | `crates/hackbot-server/src/agent_state.rs` | Extend with action types: `move_to(pid)`, `focus_on(event_type)`, `flag_anomaly(description)`, `adjust_filter(params)`. Each action has a defined effect on the world model / gateway filters. |
 | 5.4 | `frontend/src/ui/agent-panel.ts` | Extend to show LLM reasoning: display the agent's thought process as text, show the action it chose and why, show alternatives it considered. Display as a scrollable log with timestamps. |
 | 5.5 | `frontend/src/game/agent-character.ts` | Add visual indicators for agent state: "thinking" animation while LLM is processing, "acting" animation when executing, "idle" when waiting for next cycle. |
-| 5.6 | `server/server/gateway.py` | Add human override commands: `agent_pause` (stop autonomous decisions), `agent_resume`, `agent_redirect(pid)` (force agent to examine a specific process). |
-| 5.7 | `server/server/memory_store.py` (new) | Simple JSON-file-based persistence for agent findings. Stores: discovered anomalies, explored paths, pattern library (known-normal and known-anomalous event sequences). Loaded on startup, saved periodically. |
+| 5.6 | `crates/hackbot-server/src/gateway.rs` | Add human override commands: `agent_pause` (stop autonomous decisions), `agent_resume`, `agent_redirect(pid)` (force agent to examine a specific process). |
+| 5.7 | `crates/hackbot-server/src/memory_store.rs` (new) | Simple JSON-file-based persistence for agent findings using `serde_json`. Stores: discovered anomalies, explored paths, pattern library (known-normal and known-anomalous event sequences). Loaded on startup, saved periodically. |
 
 ---
 
@@ -441,7 +442,25 @@ hackbot/
 **Trade-off**: May not reveal inter-process communication patterns as clearly as a force-directed layout where communicating processes are pulled closer together. Can be upgraded to force-directed layout as an option in a later phase.
 
 ### Concern 1: Verus for formal verification and What about leveraging WASM?
-### Concern 2: in-kernel LLM?
+
+Verus can formally verify Rust code, aligning with Pillar 4 (mathematical self-improvement). WASM runtimes exist in kernel space (kernel-wasm/Wasmer, Wasmjit, Camblet/wasm3) — could provide sandboxed execution for dynamic kernel-space code without native module risks. Worth investigating as an execution sandbox for the agent's action layer.
+
+### Concern 2: In-Kernel LLM (Research Direction)
+
+See **Appendix B: In-Kernel LLM Feasibility Analysis** for a detailed technical assessment and **Appendix C: Hybrid eBPF + Kernel Module Architecture** for the refined approach.
+
+**Key insight**: eBPF and kernel modules are NOT competing alternatives — they serve complementary roles. eBPF = eyes/ears (safe, verified observation). Kernel module = brain (LLM inference). Communication via BPF maps.
+
+**Action safety breakthrough**: The LLM can generate eBPF programs as its "actions" — the kernel's own BPF verifier proves they are safe before execution. No external formal verification needed for the action layer. The verifier rejects any unsafe program. This makes the eBPF verifier the formal verification layer FOR the LLM's actions.
+
+### Concern 3: Kernel as Game World (Vision)
+
+The long-term vision: render kernel internals as an explorable 3D game world where the in-kernel LLM agent is a visible character. Two modes:
+
+1. **Exploration Mode**: Educational kernel tourism. LLM is your guide. Ask questions, follow the agent, learn how the kernel works by watching it live.
+2. **Security Mode**: Autonomous anomaly hunting. CTF-style challenges. Red/blue team kernel security research.
+
+The novelty is the combination: in-kernel AI + game visualization + real-time conversational interface. Each piece has precedent (KLLM, Dockercraft, chatbots) but the combination is unique. No existing tool offers a spatial, conversational, AI-guided experience of kernel internals.
 
 ---
 
@@ -560,3 +579,239 @@ This narrative structure serves multiple purposes:
 2. Demonstrates the complex plane's ability to detect the injected anomaly
 3. Tells a security-relevant story (side-channel probing of an LLM workload)
 4. Aligns with the research vision (detecting information leakage through trace analysis)
+
+---
+
+## Appendix B: In-Kernel LLM Feasibility Analysis
+
+**Date**: 2026-03-14
+**Status**: Research exploration
+
+### The Vision
+
+A mini LLM running as a permanent kernel thread (`kthread`) that:
+- **Never dies** — runs indefinitely like `kswapd` or `ksoftirqd`
+- **Observes kernel state directly** — reads `task_struct`, VFS, network stack, scheduler state without syscall overhead
+- **Responds to user prompts** — via `/dev/hackbot` or `/proc/hackbot` character device
+- **Wanders the kernel** — autonomously explores data structures, registers tracepoints/kprobes, follows interesting activity
+
+### Prior Art
+
+1. **KLLM** ([github.com/randombk/kllm](https://github.com/randombk/kllm)): Ports `llm.c` (GPT-2 124M) to a Linux kernel module. Proof-of-concept that barely works — 1+ minute per token, system freezes during inference, single-core CPU only. Accessed via `/dev/llm0`. Demonstrates feasibility but not practicality.
+
+2. **eBPF + ML research**: Papers show quantized neural networks (decision trees, MLPs) running in eBPF with 84% inference latency reduction vs userspace. Uses fixed-point arithmetic to avoid FPU. Limited to lightweight models by eBPF verifier constraints (instruction count, no loops, no FP).
+
+3. **WASM in kernel**: Production-quality runtimes exist — kernel-wasm (Wasmer), Wasmjit, Camblet (Cisco/wasm3). Eliminates syscall/context-switch overhead. Could host a WASM-compiled inference engine with sandboxing guarantees.
+
+### Hard Technical Constraints (from Linux 6.16 source analysis)
+
+#### 1. Floating Point: The Architectural Constraint
+
+`kernel_fpu_begin()` (`arch/x86/kernel/fpu/core.c:442`) disables preemption for the entire duration of FPU usage. Between `kernel_fpu_begin()` and `kernel_fpu_end()`, you **cannot sleep, cannot be preempted, and cannot take softirqs**.
+
+The crypto subsystem (e.g., `aesni-intel_glue.c`) shows the idiomatic pattern: grab FPU, do ONE micro-operation (single AES block), release FPU. Never held for more than microseconds.
+
+**Implication**: LLM inference must be decomposed into micro-operations (~1ms each), each wrapped in `kernel_fpu_begin/end`. A single matrix-vector multiply per FPU window. This is architecturally ugly but the only way to avoid destroying system latency.
+
+**Alternative**: INT8/INT4 quantized inference using only integer arithmetic — avoids FPU entirely. eBPF ML research validates this approach, but accuracy trade-offs for language models are severe at low bit widths without careful quantization-aware training.
+
+#### 2. Memory: Solvable
+
+- `vmalloc()` can allocate up to `totalram_pages()` — no arbitrary cap (`mm/vmalloc.c:3829`)
+- phi4-mini (3.8B params) in Q4 quantization: ~4.5GB. Fits in vmalloc on a 16GB+ machine
+- Firmware loader API (`rust/kernel/firmware.rs`) can load weights from `/lib/firmware/`
+- kthreads can use `kthread_use_mm()` to access userspace address space if needed
+
+#### 3. Kernel Threads: Perfect Fit
+
+The `kthread` API (`include/linux/kthread.h`) is exactly designed for permanent kernel threads:
+- `kthread_run()` creates and wakes a thread
+- `kthread_should_stop()` / `kthread_stop()` for clean shutdown
+- `kthread_park/unpark()` for suspend/resume (e.g., during system suspend)
+- `wait_event_interruptible()` for sleeping until work arrives
+- `kthread_worker` pattern for queuing inference requests
+
+A kthread using FPU is slightly more efficient than user-process FPU usage — no user FPU state to save (`core.c:453` checks `PF_KTHREAD`).
+
+#### 4. User Interface: Character Device or procfs
+
+Two options for prompt/response interaction:
+- **`/dev/hackbot`** (miscdevice): Rust kernel has `miscdevice` abstractions. Clean open/read/write/poll/ioctl. Best for Rust modules.
+- **`/proc/hackbot`** (procfs): `proc_ops` with `proc_read/proc_write/proc_poll`. Pattern: `/proc/kmsg` (`fs/proc/kmsg.c`) — blocking read, poll support. No Rust wrapper exists.
+
+Both support `poll()`/`epoll()` for non-blocking userspace clients.
+
+#### 5. No Math Libraries: Must Build from Scratch
+
+The kernel has **zero** ML/tensor/matrix code. You must implement:
+- Matrix-vector multiply (GEMM)
+- Softmax (or approximation)
+- Layer normalization
+- Embedding lookup
+- Attention mechanism
+- Activation functions (SiLU/GELU)
+
+All without libc, libm, BLAS, or any numerical library. This is the largest engineering effort.
+
+### Possible Architectures
+
+| Architecture | Description | Pros | Cons |
+|-------------|-------------|------|------|
+| **A: Pure in-kernel (Rust module)** | kthread + vmalloc'd weights + chunked FPU inference + /dev/hackbot | True in-kernel, maximum research novelty, direct kernel state access | Must write GEMM from scratch, FPU chunking overhead, risk of system impact |
+| **B: Kernel observer + userspace brain** | Kernel module observes via kprobes/tracepoints, sends to userspace LLM via netlink/ring buffer | Works today, GPU acceleration, use ollama/phi4-mini as-is | Not truly "in-kernel", kernel↔userspace latency |
+| **C: WASM runtime in kernel** | Load kernel-wasm, compile quantized INT8 engine to WASM, run in kernel | Sandboxed execution, portable | WASM overhead, integer-only (no FPU in WASM), complex toolchain |
+
+### Recommended Path
+
+1. **Start with Architecture A** but with a **tiny model** (~1-10M parameters, not phi4-mini). The goal is proving the kernel module infrastructure, not model quality. TinyStories-1M or a custom-trained small transformer.
+
+2. **Write the inference engine in Rust** as a kernel module. Use integer-only (INT8) arithmetic initially to avoid FPU complexity entirely. Graduate to FPU-chunked FP16 once the pipeline works.
+
+3. **Load weights via firmware API** (`request_firmware()` → `/lib/firmware/hackbot-model.bin`).
+
+4. **Interface via miscdevice** (`/dev/hackbot`) — Rust abstractions exist.
+
+5. **Observation layer**: The kthread has direct access to `task_struct` linked list, `/proc`-equivalent information, and can register kprobes/tracepoints. Build observation capabilities incrementally.
+
+6. **Scale up** once infrastructure is proven: larger models (phi4-mini), FPU-based inference, autonomous wandering with formal verification (Verus) on the action layer.
+
+### The Safety Insight
+
+> "관찰만 하면 그래도 괜찮은데 action이(손발) 주어지면 엄청 위험하지?! 그래서 formal verification??"
+
+This is the key research insight. An in-kernel LLM has two modes:
+- **Observe-only**: Read kernel state, report findings. Safe — worst case is information leak to the user who already has root.
+- **Act**: Modify kernel state, adjust filters, kill processes, change scheduling. **Extremely dangerous** — a hallucinating LLM with kernel write access could crash or corrupt the system.
+
+Formal verification (Verus) on the action layer could prove that the agent's possible actions form a safe subset — e.g., it can read any `task_struct` but can only write to its own data structures. This is the "new generation of OS" insight: a formally verified autonomous kernel agent.
+
+### Model Size Reality Check
+
+| Model | Params | Q4 Size | Est. Tokens/sec (CPU, single-core, kernel) | Feasibility |
+|-------|--------|---------|---------------------------------------------|-------------|
+| Custom tiny | 1M | ~2MB | 50-100 | Start here |
+| TinyStories | 33M | ~20MB | 5-10 | Good first target |
+| GPT-2 small | 124M | ~70MB | 1-3 (KLLM achieved ~0.01) | Possible with better impl |
+| phi4-mini | 3.8B | ~4.5GB | <0.1 | Not viable without GPU/NPU |
+
+The right strategy is to nail the infrastructure with a tiny model, then explore hardware acceleration paths (NPU via `drivers/accel/ivpu/`, GPU DMA) for larger models.
+
+---
+
+## Appendix C: Hybrid eBPF + Kernel Module Architecture
+
+**Date**: 2026-03-14
+
+### Why Not Either/Or
+
+eBPF and kernel modules serve fundamentally different roles. They are **complementary**, not competing:
+
+| Role | eBPF | Kernel Module |
+|------|------|---------------|
+| **Observation** (tracing syscalls, scheduling, power) | Excellent — purpose-built, verifier-guaranteed safe | Possible but must implement manually |
+| **LLM Inference** (matrix ops, attention, generation) | Impossible — no FP, 512B stack, bounded loops, verifier rejects | Feasible — kthread + FPU + vmalloc (KLLM proved it) |
+| **Safety guarantee** | BPF verifier proves program safety before loading | No verifier — bugs can panic kernel |
+| **Dynamic loading** | Load/unload at runtime, no reboot | Module load/unload |
+| **Communication** | BPF maps, ring buffers, perf buffers | Any kernel API |
+
+### The Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       KERNEL SPACE                           │
+│                                                              │
+│  ┌────────────────────┐        ┌──────────────────────────┐ │
+│  │  eBPF Programs      │        │  Rust Kernel Module      │ │
+│  │  (THE EYES & EARS)  │        │  (THE BRAIN)             │ │
+│  │                     │  BPF   │                          │ │
+│  │  • kprobes/syscalls │──maps──│  • LLM inference kthread │ │
+│  │  • tracepoints      │───────>│  • reads observations    │ │
+│  │  • sched events     │        │  • generates responses   │ │
+│  │  • power/perf       │<───────│  • proposes eBPF actions │ │
+│  │  • network probes   │        │  • /dev/hackbot iface    │ │
+│  │                     │        │                          │ │
+│  │  ★ REUSE EXISTING   │        │  ★ NEW IMPLEMENTATION    │ │
+│  │    eBPF TRACER!     │        │                          │ │
+│  └─────────┬──────────┘        └──────────┬───────────────┘ │
+│            │ ring buffer                   │ /dev/hackbot     │
+└────────────┼───────────────────────────────┼─────────────────┘
+             │                               │
+             ▼                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                       USER SPACE                             │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  hackbot-server (Rust / Axum + Tokio)                 │   │
+│  │  • reads ring buffer → trace events for visualization │   │
+│  │  • reads /dev/hackbot → LLM state, responses          │   │
+│  │  • writes /dev/hackbot → user prompts to LLM          │   │
+│  │  • WebSocket gateway to frontend                      │   │
+│  └─────────────────────────┬────────────────────────────┘   │
+│                             │ WebSocket                      │
+│  ┌─────────────────────────┴────────────────────────────┐   │
+│  │  Frontend (TypeScript + Pixi.js → Three.js)           │   │
+│  │                                                       │   │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌────────────────┐  │   │
+│  │  │ Game World   │ │ Chat Panel  │ │ Signal View    │  │   │
+│  │  │ (3D kernel)  │ │ (LLM chat)  │ │ (complex plane)│  │   │
+│  │  │              │ │             │ │                │  │   │
+│  │  │ • Processes  │ │ • Ask agent │ │ • Orbit plot   │  │   │
+│  │  │   as rooms   │ │ • See its   │ │ • Anomaly      │  │   │
+│  │  │ • Syscalls   │ │   thoughts  │ │   detection    │  │   │
+│  │  │   as events  │ │ • Direct it │ │                │  │   │
+│  │  │ • Agent as   │ │   anywhere  │ │                │  │   │
+│  │  │   character  │ │             │ │                │  │   │
+│  │  └─────────────┘ └─────────────┘ └────────────────┘  │   │
+│  └───────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### eBPF Verifier as Formal Verification for LLM Actions
+
+The breakthrough insight: the LLM's **action safety problem** can be solved by the kernel's own BPF verifier.
+
+Instead of needing Verus to formally verify every possible action the LLM might take:
+
+1. The LLM **generates eBPF programs** as its "actions" (e.g., "attach a kprobe to function X", "filter packets matching pattern Y", "trace process Z's syscalls")
+2. The eBPF programs are submitted to the **kernel's BPF verifier**
+3. The verifier **proves safety** (termination, memory bounds, no kernel corruption) or **rejects** the program
+4. Only verified programs are loaded and executed
+
+This is elegant because:
+- The BPF verifier is battle-tested (millions of production deployments)
+- It guarantees: no infinite loops, no out-of-bounds access, no kernel state corruption
+- The LLM can be creative/exploratory — the verifier catches any unsafe proposals
+- No external formal verification toolchain needed for the action layer
+- The action space is naturally bounded by what eBPF helpers permit
+
+**The LLM proposes. The verifier disposes.**
+
+### Reusing the Existing eBPF Tracer
+
+The user's existing eBPF tracer project can be directly integrated:
+
+1. **As-is for Phase 3**: The tracer feeds trace events through a ring buffer to hackbot-server for visualization. Zero changes to the tracer needed.
+
+2. **Extended for LLM observation**: Add BPF map outputs alongside ring buffer. The in-kernel LLM module reads these maps directly (no userspace roundtrip). The tracer becomes the LLM's sensory input.
+
+3. **As a template for LLM-generated probes**: The existing tracer's eBPF programs serve as templates/examples for the LLM to generate new probes. The LLM learns the patterns and can propose variations.
+
+### Two Game Modes (Future Vision)
+
+**Mode 1: Kernel Explorer** — "Tourism"
+- Walk through the kernel as a 3D world
+- Processes are buildings, memory regions are terrain, syscalls are visible events
+- The LLM agent is your guide — follows you, explains what you see
+- "What is this process doing?" → Agent inspects and narrates
+- "Show me the hottest code path" → Agent leads you there
+- Educational tool for OS courses, onboarding kernel developers
+
+**Mode 2: Kernel Hacker** — "Security"
+- The LLM autonomously hunts for anomalies
+- Visualize attack surfaces, side-channel leaks, resource contention
+- CTF-style challenges: "Find the covert channel in this workload"
+- Red team: Agent attempts to find vulnerabilities
+- Blue team: Agent monitors and alerts on suspicious patterns
+- Research tool for kernel security analysis
+
+Both modes share the same infrastructure. The difference is the LLM's objective and the visualization emphasis.
