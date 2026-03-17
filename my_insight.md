@@ -1,4 +1,13 @@
 - in-kernel llm (ebpf 가 kernel verifier 처럼.?) (커널 trace data로 학습?? 경량 로컬 llm을 보완하는 방법? 커널의 동작 데이터가 엄청 많잖아.?!) (ollama + phi4 로 테스트.?) (in kernel llm 이 보는것만 하면 그래도 괜찮은데 action이(손발) 주어지면 엄청 위험하지?! 그래서 formal verification?? 만약 이게 된다?? 그럼 os의 새로운 generation 아닐까?!) (observability and transparency)
+- alphafold(AlphaFold is an AI system developed by Google DeepMind that predicts a protein’s 3D structure from its amino acid sequence.)를 활용해볼 순 없을까? 이걸 이렇게 문자을 적어보면..? (predicts a kernel's 3D structure from its traced sequence.) (kernel에서 protein에 해당하는게 뭘까..? 이게 the art of modeling(mapping)?) / tracing sequence로 뭔가 학습해서 예측에 쓰일 수 있지 않을까.? / llm 이랑 fuzzing 이랑 뭐가 다른거지.?!.? syscall sequence 만드는 건 같다.?!.!!
+
+
+# Mathematical thoughts
+- Euler's formula
+- Complex plane
+- Alphafold (predicting a protein's 3D structure from its amino acid sequence.)
+- Sequential Monte Carlo
+- DNA sequencing
 
 
 # My inqueries 

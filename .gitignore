@@ -4,3 +4,15 @@ CLAUDE.md
 node_modules/
 target/
 dist/
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.*.cmd
+.*.o
+.tmp_versions/

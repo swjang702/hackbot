@@ -39,7 +39,7 @@ module! {
 // Module registration
 // ---------------------------------------------------------------------------
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 struct HackbotModule {
     #[pin]
     _miscdev: MiscDeviceRegistration<HackbotDev>,
@@ -59,8 +59,9 @@ impl kernel::InPlaceModule for HackbotModule {
     }
 }
 
-impl Drop for HackbotModule {
-    fn drop(&mut self) {
+#[pinned_drop]
+impl PinnedDrop for HackbotModule {
+    fn drop(self: Pin<&mut Self>) {
         pr_info!("hackbot: unloading module\n");
     }
 }
