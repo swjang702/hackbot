@@ -657,44 +657,174 @@ All without libc, libm, BLAS, or any numerical library. This is the largest engi
 
 | Architecture | Description | Pros | Cons |
 |-------------|-------------|------|------|
-| **A: Pure in-kernel (Rust module)** | kthread + vmalloc'd weights + chunked FPU inference + /dev/hackbot | True in-kernel, maximum research novelty, direct kernel state access | Must write GEMM from scratch, FPU chunking overhead, risk of system impact |
-| **B: Kernel observer + userspace brain** | Kernel module observes via kprobes/tracepoints, sends to userspace LLM via netlink/ring buffer | Works today, GPU acceleration, use ollama/phi4-mini as-is | Not truly "in-kernel", kernel↔userspace latency |
+| **A: Pure in-kernel (Rust module)** | kthread + vmalloc'd weights + chunked FPU inference + /dev/hackbot | True in-kernel, maximum research novelty, direct kernel state access | Must write GEMM from scratch, CPU-only (no GPU kernel API exists), limited model size |
+| **B: Kernel socket → vLLM/ollama** | Kernel module uses kernel socket API to call localhost LLM server | Full model quality, GPU-accelerated, ~200 lines of code, works in days | LLM brain not truly in-kernel, requires userspace server running |
 | **C: WASM runtime in kernel** | Load kernel-wasm, compile quantized INT8 engine to WASM, run in kernel | Sandboxed execution, portable | WASM overhead, integer-only (no FPU in WASM), complex toolchain |
+| **D: Hybrid System 1/2** | Small model in-kernel (A) + large model via socket (B) | Best of both: instant reflexes + deep reasoning | Most complex architecture, two inference paths |
 
-### Recommended Path
+#### Why Not GPU from Kernel?
 
-1. **Start with Architecture A** but with a **tiny model** (~1-10M parameters, not phi4-mini). The goal is proving the kernel module infrastructure, not model quality. TinyStories-1M or a custom-trained small transformer.
+Investigated in Linux 6.19.8: **zero kernel-internal APIs exist for GPU/NPU compute dispatch.** All compute (CUDA, ROCm, OpenVINO) is gated behind userspace ioctls. The `drivers/accel/` framework is registration plumbing, not a compute API. No accelerator driver exports any compute symbols for external module use. Pure in-kernel inference is CPU-only by design.
 
-2. **Write the inference engine in Rust** as a kernel module. Use integer-only (INT8) arithmetic initially to avoid FPU complexity entirely. Graduate to FPU-chunked FP16 once the pipeline works.
+### Recommended Path: System 1/System 2 Hybrid (Architecture D)
 
-3. **Load weights via firmware API** (`request_firmware()` → `/lib/firmware/hackbot-model.bin`).
+**The Biological Analogy**: Like the human nervous system — the spinal cord produces instant reflexes (knee-jerk reaction when danger is detected), while nerve signals travel to the brain for conscious analysis. The body reacts BEFORE the brain understands why.
 
-4. **Interface via miscdevice** (`/dev/hackbot`) — Rust abstractions exist.
+```
+[hackbot.ko kthread — THE AGENT'S BODY]
+│
+├── System 1: SPINAL CORD (in-kernel, instant)
+│   ├── Tiny INT8 model (~1-33M params) in vmalloc
+│   ├── Pattern matching: "is this syscall pattern anomalous?"
+│   ├── Instant reflexes: alert, flag, highlight
+│   ├── No network, no latency, no external dependency
+│   └── Tier 0-1 actions only (observe + instrument)
+│
+└── System 2: BRAIN (vLLM via kernel socket, deep)
+    ├── Large model (phi4-mini/Llama 3) on GPU
+    ├── Complex reasoning: "what IS this anomaly? what should we do?"
+    ├── kernel_connect(127.0.0.1) → HTTP POST → ollama/vLLM
+    ├── Response arrives 50-500ms later
+    └── Can REQUEST Tier 2+ actions (requires human approval)
+```
 
-5. **Observation layer**: The kthread has direct access to `task_struct` linked list, `/proc`-equivalent information, and can register kprobes/tracepoints. Build observation capabilities incrementally.
+**Implementation Steps**:
 
-6. **Scale up** once infrastructure is proven: larger models (phi4-mini), FPU-based inference, autonomous wandering with formal verification (Verus) on the action layer.
+| Step | What | Architecture | Duration |
+|------|------|-------------|----------|
+| **1** | Kernel module skeleton: `/dev/hackbot` + prompt/response | Infrastructure | **DONE** |
+| **2a** | Kernel socket client → ollama/vLLM (System 2 brain) | B | 1 week |
+| **2b** | Tiny in-kernel INT8 inference engine (System 1 reflex) | A | 2-3 weeks |
+| **2c** | Merge: System 1 handles fast decisions, System 2 handles deep analysis | D | 1 week |
+| **3** | Observation layer: read task_struct, attach kprobes | All | 1-2 weeks |
+| **4** | Action capability system with tiered safety | All | 1-2 weeks |
+| **5** | 3D game rendering of agent behavior | Frontend | 2-3 weeks |
 
-### The Safety Insight
+Step 2a comes first because it gives us a **working, useful agent in days**. Step 2b runs in parallel as a research challenge. Step 2c merges them into the hybrid.
+
+### Action Safety: Tiered Capability System
 
 > "관찰만 하면 그래도 괜찮은데 action이(손발) 주어지면 엄청 위험하지?! 그래서 formal verification??"
 
-This is the key research insight. An in-kernel LLM has two modes:
-- **Observe-only**: Read kernel state, report findings. Safe — worst case is information leak to the user who already has root.
-- **Act**: Modify kernel state, adjust filters, kill processes, change scheduling. **Extremely dangerous** — a hallucinating LLM with kernel write access could crash or corrupt the system.
+An in-kernel LLM agent needs a **capability-based security model** — like microkernel capability tokens. The agent can only perform actions it has been explicitly granted.
 
-Formal verification (Verus) on the action layer could prove that the agent's possible actions form a safe subset — e.g., it can read any `task_struct` but can only write to its own data structures. This is the "new generation of OS" insight: a formally verified autonomous kernel agent.
+#### Action Tiers
+
+| Tier | Category | Examples | Risk | Default |
+|------|----------|----------|------|---------|
+| **0** | Pure Observation | Read task_struct, read /proc-equivalent, read scheduler queues, read VFS state | None — read-only, cannot corrupt kernel | **GRANTED** |
+| **1** | Instrumentation | Attach kprobes, register tracepoints, set eBPF filters, read perf counters | Low — reversible, well-defined APIs. Risk: performance impact from too many probes | **GRANTED** |
+| **2** | Indirect Actions | Adjust nice values, send SIGTERM/SIGSTOP, modify cgroup params, adjust net QoS | Medium — affects system behavior through standard APIs. Could disrupt services | **REQUIRES HUMAN APPROVAL** |
+| **3** | Direct Kernel Modification | Write kernel memory, modify function pointers, patch running code, change security policies | **EXTREME** — can crash kernel, create security holes, corrupt state | **NEVER** (unless Verus-verified) |
+
+#### Safety Architecture (Defense in Depth)
+
+```
+Layer 3: Verus Formal Verification (compile-time)
+  └── Proves the capability system itself is correctly implemented
+  └── Proves Tier 0-1 actions cannot corrupt kernel state
+  └── Future: proves specific Tier 2 actions are safe
+
+Layer 2: eBPF Verifier (load-time)
+  └── LLM-generated eBPF programs verified before execution
+  └── Guarantees: termination, memory bounds, no corruption
+  └── "The LLM proposes. The verifier disposes."
+
+Layer 1: Capability Boundary (runtime)
+  └── Agent can only call functions it has capability tokens for
+  └── System 1 (reflex): limited to Tier 0-1 (observe + instrument)
+  └── System 2 (brain): can REQUEST Tier 2, user must approve
+  └── Tier 3: structurally impossible without Verus-verified code
+
+Layer 0: Rust Type System (compile-time)
+  └── Memory safety, no data races, no null derefs
+  └── Unsafe FFI only for kernel_fpu_begin/end
+```
+
+#### The Kill Switch
+
+The user can instantly revoke all capabilities via `/dev/hackbot`:
+- `echo "STOP" > /dev/hackbot` — reverts agent to Tier 0 observation-only
+- `echo "PARK" > /dev/hackbot` — parks the kthread entirely (kthread_park)
+- `rmmod hackbot` — removes the agent completely
+
+All actions are logged to a ring buffer and streamed to the visualization frontend.
+
+#### System 1 vs System 2 Safety Mapping
+
+| | System 1 (Reflex) | System 2 (Brain) |
+|---|---|---|
+| **Allowed tiers** | 0-1 (observe + instrument) | 0-2 (can REQUEST actions) |
+| **Human approval needed** | Never | Yes, for Tier 2 |
+| **Speed** | Instant (<1ms) | 50-500ms |
+| **When** | Always running, continuous monitoring | On-demand or periodic deep analysis |
+| **Example** | "Anomaly detected in PID 1234!" (instant alert) | "PID 1234 is performing a side-channel attack on the LLM workload via /proc/maps reads. Recommend: adjust cgroup isolation." |
+
+### 3D Game Rendering of Agent Behavior
+
+The in-kernel agent's behavior maps naturally to the game visualization:
+
+#### Visual Mapping
+
+| Agent Behavior | Game World Representation |
+|---------------|--------------------------|
+| Agent observing a process | Character standing in a process room, "looking" at events |
+| System 1 reflex (anomaly detected) | **Instant red flash** — room borders glow red, particles burst, alert sound |
+| System 2 thinking | Character shows "thinking" animation (pulsing glow), chat panel shows "Analyzing..." |
+| System 2 response arrives | Speech bubble appears above character, detailed text in chat panel |
+| Agent moving to new process | Character smoothly walks through corridors between rooms |
+| kprobe attached | "Sensor" icon appears on the target function (like placing a trap in a game) |
+| Agent idle / patrolling | Character slowly wanders, looking around (ambient animation) |
+| Kill switch activated | Character freezes, turns grey, "PAUSED" overlay |
+
+#### Two-Speed Visual Feedback
+
+The biological System 1/2 split creates a compelling visual rhythm:
+
+1. **Fast pulse** (System 1): The game world constantly pulses with real-time kernel activity. Syscalls flash, processes glow based on load, the agent reacts instantly to anomalies. This is the "heartbeat" of the visualization.
+
+2. **Slow narrative** (System 2): Periodically, the agent pauses to "think." After 1-2 seconds, a detailed analysis appears. The user can read the agent's reasoning while the real-time visualization continues in the background.
+
+This two-speed feedback is more engaging than a single-speed agent. Users can SEE the difference between instinct and reasoning — like watching a predator's ears perk up (reflex) before it makes a deliberate decision to pursue (reasoning).
+
+#### 3D World Structure
+
+```
+The Kernel World (3D game environment)
+│
+├── Process Buildings — each process is a 3D structure
+│   ├── Room interior — syscalls visualized as events inside
+│   ├── Size proportional to resource usage
+│   └── Color indicates state (running=green, sleeping=blue, zombie=red)
+│
+├── Memory Terrain — heap/stack visualized as landscape
+│   ├── Height = memory pressure
+│   └── Hot regions glow
+│
+├── Network Corridors — connections between processes
+│   ├── Width = bandwidth
+│   └── Packets visualized as particles flowing through
+│
+├── The Agent Character — hackbot
+│   ├── Visible in the world, navigable by user or autonomous
+│   ├── Field of view circle shows observation range
+│   └── Sensor icons show where kprobes are attached
+│
+└── The Anomaly Zone — areas flagged by System 1
+    ├── Red fog/glow around suspicious processes
+    ├── Pulsing alert indicators
+    └── System 2 analysis text floating nearby
+```
 
 ### Model Size Reality Check
 
-| Model | Params | Q4 Size | Est. Tokens/sec (CPU, single-core, kernel) | Feasibility |
-|-------|--------|---------|---------------------------------------------|-------------|
-| Custom tiny | 1M | ~2MB | 50-100 | Start here |
-| TinyStories | 33M | ~20MB | 5-10 | Good first target |
-| GPT-2 small | 124M | ~70MB | 1-3 (KLLM achieved ~0.01) | Possible with better impl |
-| phi4-mini | 3.8B | ~4.5GB | <0.1 | Not viable without GPU/NPU |
-
-The right strategy is to nail the infrastructure with a tiny model, then explore hardware acceleration paths (NPU via `drivers/accel/ivpu/`, GPU DMA) for larger models.
+| Model | Params | Q4 Size | System | Tokens/sec | Use |
+|-------|--------|---------|--------|-----------|-----|
+| Custom tiny | 1M | ~2MB | 1 (in-kernel) | 50-100 | Pattern matching, anomaly flagging |
+| TinyStories | 33M | ~20MB | 1 (in-kernel) | 5-10 | Simple observation summaries |
+| GPT-2 small | 124M | ~70MB | 1 (in-kernel) | 1-3 | Basic reasoning (ambitious) |
+| phi4-mini | 3.8B | ~4.5GB | 2 (vLLM/GPU) | 20-50 | Full reasoning, analysis, planning |
+| Llama 3 | 8B | ~5GB | 2 (vLLM/GPU) | 10-30 | State-of-art reasoning |
 
 ---
 

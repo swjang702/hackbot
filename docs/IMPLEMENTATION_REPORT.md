@@ -175,11 +175,67 @@ ssh -L 5173:localhost:5173 -L 8000:localhost:8000 fedora
 - Frontend: Canvas 2D orbit plot + phase diagram panel
 - Anomaly detection: EMA + standard deviation threshold
 
-### In-Kernel LLM (Research Exploration)
-- Feasibility analysis completed (see `docs/PLAN.md` Appendix B + C)
-- Prior art: KLLM (GPT-2 124M kernel module), eBPF+ML research, kernel-wasm runtimes
-- Key constraints: FPU preemption, no math libraries in kernel, GB-scale vmalloc
-- **Hybrid architecture decided**: eBPF = eyes/ears (observation, reuse existing tracer), Rust kernel module = brain (LLM inference)
-- **Action safety via BPF verifier**: LLM generates eBPF programs as actions, kernel verifier proves safety before execution
-- Plan: Start with tiny model (~1-10M params), INT8 inference, Rust kernel module, /dev/hackbot interface
-- Vision: Kernel as 3D game world with two modes (Explorer/Tourism + Hacker/Security), real-time LLM chat interface
+### In-Kernel LLM — System 1/System 2 Hybrid Architecture
+
+**Architecture decided** (see `docs/PLAN.md` Appendix B + C for full analysis):
+
+- **System 1 (Spinal Cord)**: Tiny INT8 model (~1-33M params) running purely in-kernel. Instant pattern matching and anomaly reflexes. No network, no external dependency.
+- **System 2 (Brain)**: Large model (phi4-mini/Llama 3) via kernel socket → vLLM/ollama. Deep reasoning, analysis, planning. GPU-accelerated, 20-50 tok/s.
+- **Biological analogy**: Like a knee-jerk reflex — the body reacts BEFORE the brain understands why. System 1 alerts instantly, System 2 explains after 50-500ms.
+
+**Implementation steps**:
+1. Step 1: `/dev/hackbot` module skeleton — **DONE**
+2. Step 2a: Kernel socket → ollama/vLLM (System 2, working agent fast)
+3. Step 2b: In-kernel INT8 inference (System 1, research challenge)
+4. Step 2c: Merge into hybrid System 1/2
+
+**Safety**: Tiered capability system (Tier 0: observe → Tier 3: modify kernel). System 1 limited to Tier 0-1 (safe). System 2 can request Tier 2 (requires human approval). Tier 3 requires Verus verification. Defense in depth: Rust type system → capability boundary → eBPF verifier → Verus proofs.
+
+**3D rendering**: Agent behavior maps to game world — reflexes as instant visual flashes, reasoning as delayed speech bubbles. Two-speed feedback creates compelling rhythm.
+
+## Research: GPU/NPU Compute from Kernel Space (Linux 6.19.8)
+
+**Date**: 2026-03-17
+**Status**: Research complete. Conclusion: not feasible via existing APIs.
+
+### Question
+
+Can a Linux kernel module dispatch compute workloads (matrix multiply, inference) to GPU or NPU hardware?
+
+### Findings
+
+**The accel framework (`drivers/accel/`) is device registration plumbing only.** It creates `/dev/accel/accelN` char devices and hooks them into DRM. One exported symbol: `accel_open()`. No compute submission API.
+
+**Every accelerator driver exports zero symbols.** Checked all six: ivpu (Intel NPU), habanalabs (Gaudi), amdxdna (AMD AI Engine), qaic (Qualcomm Cloud AI), rocket (RISC-V NPU), ethosu (Arm Ethos-U). All job submission is via driver-specific DRM ioctls, callable only from userspace.
+
+**The DRM GPU Scheduler (`include/drm/gpu_scheduler.h`) is exported but is infrastructure for driver authors**, not a client API. Using it requires owning the hardware, implementing backend_ops, setting up GPU MMU, and managing firmware comms -- i.e., writing an entire GPU driver.
+
+**GPU drivers export almost nothing useful for compute.** AMD exports ISP buffer helpers for camera pipeline. i915 exports GVT (virtualization) and thermal/power management hooks. Xe exports only KUnit test symbols.
+
+**Raw DMA/MMIO is technically possible but practically insane.** Would require reimplementing the GPU firmware protocol, MMU page tables, command rings, and fighting the existing driver for device ownership.
+
+### Architecture (by design)
+
+```
+Hardware <--> Kernel Driver (exclusive device owner) <--> Userspace (ioctls only)
+```
+
+There is no kernel-internal compute dispatch layer. This is deliberate: GPU drivers are complex state machines managing firmware, MMU, power, and recovery. No stable internal ABI exists for this.
+
+### Implications for In-Kernel LLM
+
+1. **CPU-only (kernel_fpu_begin/end + AVX)**: Feasible for tiny models. Must not sleep while holding FPU.
+2. **Kernel module calls /dev/accel via filp_open/vfs_ioctl**: Possible but architecturally repulsive (kernel pretending to be userspace).
+3. **Custom driver that unbinds existing NPU driver**: Enormous effort, architecturally honest.
+4. **Userspace daemon + netlink/chardev IPC**: The correct answer for anything beyond toy-scale inference.
+
+### Key Source Files Examined
+
+- `drivers/accel/drm_accel.c` -- accel framework core (209 lines, 1 export)
+- `include/drm/drm_accel.h` -- accel header (device registration macros only)
+- `include/drm/gpu_scheduler.h` -- GPU scheduler (driver infrastructure, not client API)
+- `include/drm/drm_gpuvm.h` -- GPU VM manager (driver infrastructure)
+- `drivers/accel/ivpu/ivpu_job.c` -- IVPU job submission (ioctl-gated, requires drm_file)
+- `drivers/accel/ivpu/ivpu_drv.h` -- IVPU device structure (all internal, no exports)
+- `drivers/gpu/drm/amd/amdgpu/amdgpu_isp.c` -- only AMD exports (ISP camera buffer helpers)
+- `include/linux/dma-mapping.h` -- DMA APIs (available but useless without driver cooperation)
