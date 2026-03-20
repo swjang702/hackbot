@@ -4,6 +4,8 @@ CLAUDE.md
 node_modules/
 target/
 dist/
+vllm/
+linux-6.19.8/
 
 # Kernel module build artifacts
 *.o
