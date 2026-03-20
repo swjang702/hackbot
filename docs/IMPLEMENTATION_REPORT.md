@@ -168,30 +168,189 @@ ssh -L 5173:localhost:5173 -L 8000:localhost:8000 fedora
 
 ---
 
+## Step 2a: vLLM Inference via Kernel Socket
+
+**Status**: Implementation complete (builds successfully)
+**Date**: 2026-03-18
+
+### Overview
+
+Replaced the Step 1 dummy echo with a real LLM inference path. The kernel module creates a TCP socket to a localhost vLLM server, sends the user's prompt as an HTTP POST to `/v1/completions`, and returns the completion text.
+
+### Architecture
+
+```
+write("/dev/hackbot", prompt)
+  → hackbot.ko: sock_create_kern() + kernel_connect(127.0.0.1:8000)
+  → kernel_sendmsg(): HTTP POST /v1/completions {"prompt":"...","max_tokens":512}
+  → kernel_recvmsg(): receive full HTTP response
+  → parse HTTP status, extract JSON "text" field
+  → store in response buffer, signal CondVar
+read("/dev/hackbot")
+  → returns the LLM-generated text
+```
+
+### Key Implementation Details
+
+**Kernel Socket FFI** — No Rust networking bindings exist in Linux 6.19.8. Wrote thin unsafe wrappers around:
+- `sock_create_kern()` — creates kernel-owned TCP socket in init_net namespace
+- `kernel_connect()` — connects to vLLM server. Required defining `SockaddrIn` manually (not in bindgen output)
+- `kernel_sendmsg()` / `kernel_recvmsg()` — send/receive via `kvec` + zero-initialized `msghdr`
+- `sock_release()` — cleanup via RAII `Drop` impl on `KernelSocket` wrapper
+
+**HTTP Client** — Minimal HTTP/1.1 client built from raw bytes:
+- Sends `Connection: close` to ensure clean socket lifecycle
+- Formats `Content-Length` without sprintf (custom `format_usize`)
+- Parses response status code and locates body after `\r\n\r\n`
+
+**JSON Handling** — No serde in kernel space:
+- `json_escape()`: escapes prompt for JSON embedding (handles `\ " \n \r \t`)
+- `extract_text_from_json()`: finds `"text":"` pattern and extracts string value
+- `json_unescape()`: unescapes the extracted text back to raw bytes
+- `find_json_string_end()`: handles escaped characters within JSON strings
+
+**Error Handling** — Graceful degradation:
+- Connection refused (errno 111): human-readable hint about vLLM not running
+- Connection timeout (errno 110): hint about network issues
+- Non-200 HTTP status: returns the response body as error message
+- JSON parse failure: returns raw response body as fallback
+
+**Design Decisions**:
+- Blocking write: socket call runs in write_iter's process context (can sleep). Simpler than kthread for Step 2a. Future Step 2c will move to async kthread.
+- Port 8000 hardcoded as const: matches vLLM default. Module parameters deferred.
+- `sock_create_kern` over `sock_create`: creates kernel-owned socket not tied to calling process.
+- Max 64KB response: prevents unbounded kernel memory allocation from vLLM responses.
+- `Connection: close` header: forces vLLM to close connection after response, so `recv_all` terminates.
+
+### Files Changed
+
+- `hackbot-kmod/hackbot.rs` — Complete rewrite of inference path (100 → 460 lines)
+- `hackbot-kmod/README.md` — Updated for Step 2a usage
+
+---
+
+## Step 2b: Kernel-Aware Inference with Live Context Injection
+
+**Status**: Implementation complete (builds successfully)
+**Date**: 2026-03-20
+
+### Overview
+
+Three changes in this step, each solving a real problem discovered during testing:
+
+1. **Remote vLLM via Tailscale** — connected to keti GPU server (100.125.213.42) instead of localhost
+2. **Global shared response buffer** — fixed cross-fd bug where `echo > /dev/hackbot` + `cat /dev/hackbot` lost the response
+3. **Kernel context injection** — the LLM now receives live kernel state gathered from ring 0 APIs
+
+### Architecture
+
+```
+write("/dev/hackbot", prompt)
+  → hackbot.ko: gather_kernel_context()
+      ├── kernel_version::KERNEL_RELEASE (compile-time from Kbuild)
+      ├── ktime_get_boot_fast_ns() → uptime
+      ├── __num_online_cpus → CPU count
+      ├── si_meminfo() → memory stats
+      └── Task::current_raw() → caller pid + comm
+  → build prompt:
+      [System Identity]
+      [=== LIVE KERNEL STATE ===]
+      [Kernel: Linux 6.19.8 x86_64]
+      [Uptime: 3d 2h 15m 42s]
+      [CPUs: 8 online]
+      [Memory: 4217 MB used / 16384 MB total]
+      [Caller: pid=1234 (bash)]
+      [=========================]
+      [User: <prompt>]
+      [hackbot: ]
+  → KernelSocket::connect_tcp(100.125.213.42:8000)
+  → HTTP POST /v1/completions → vLLM on keti (Tailscale)
+  → parse response → store in global RESPONSE buffer
+read("/dev/hackbot")
+  → read from global RESPONSE buffer (any fd can read)
+```
+
+### Key Implementation Details
+
+**Remote vLLM via Tailscale**:
+- `VLLM_ADDR` changed from `127.0.0.1` to `100.125.213.42` (Tailscale IP for keti GPU server)
+- Tailscale encrypts traffic via WireGuard, so plaintext HTTP is acceptable
+- IP address is single-source-of-truth: `append_ipv4()` helper generates the Host header and log messages from `VLLM_ADDR` constant — no hardcoded IP strings elsewhere
+- keti runs `vllm serve facebook/opt-125m --port 8000`
+
+**Global Shared Response Buffer** (cross-fd bug fix):
+- **Root cause**: Per-fd state meant `echo > /dev/hackbot` (write fd) and `cat /dev/hackbot` (read fd) each got their own `HackbotDev` with independent buffers. The response was lost when the write fd closed.
+- **Fix**: Device-global `SharedResponse` protected by kernel's `global_lock!` macro (`static RESPONSE: Mutex<SharedResponse>`)
+- `write_iter`: reads prompt locally (no lock), calls vLLM (no lock held during network I/O), then briefly locks global to store result
+- `read_iter`: locks global, copies data to userspace via `simple_read_from_buffer`, returns EOF if no response ready
+- Per-fd `HackbotDev` is now lightweight (just holds device reference)
+- Removed per-fd `Mutex<Inner>` and `CondVar` — no longer needed
+
+**Kernel Context Injection** (giving the LLM "eyes"):
+- `gather_kernel_context()` called on every prompt, returns live system state as formatted text
+- Data sources (all ring 0 kernel APIs):
+
+| Data | Kernel API | Notes |
+|---|---|---|
+| Kernel version | `KERNELRELEASE` | Compile-time via Kbuild-generated `kernel_version.rs` |
+| Uptime | `ktime_get_boot_fast_ns()` | u64 nanoseconds → d/h/m/s format |
+| CPU count | `__num_online_cpus` | Volatile read of atomic_t counter field |
+| Memory | `si_meminfo()` | Fills `sysinfo` struct; totalram/freeram × mem_unit |
+| Caller | `Task::current_raw()` | pid + comm from `task_struct` (benign race on comm) |
+
+**Kbuild Integration** — `kernel_version.rs` auto-generated:
+- `Kbuild` rule generates `kernel_version.rs` from `KERNELRELEASE` env var
+- Contains `pub(crate) const KERNEL_RELEASE: &[u8] = b"6.19.8";`
+- Ensures version string always matches the kernel the module was built for
+- Added to `.gitignore` as build artifact
+
+**System Prompt Structure**:
+- `SYSTEM_IDENTITY` constant: agent identity and instructions
+- `gather_kernel_context()`: live kernel state block
+- `"User: "` prefix + user prompt
+- `RESPONSE_PREFIX` (`"\nhackbot: "`): guides model output
+
+### Design Decisions
+
+- **Global vs per-fd state**: Global is correct for `echo`/`cat` workflow. Single-slot design — concurrent writers overwrite. Acceptable for single-user research tool.
+- **No lock during vLLM call**: The global mutex is only held briefly for the memcpy of the response, not during the multi-second network round-trip. This keeps the device responsive.
+- **read_iter returns EOF (not blocks) when no response**: Prevents `cat` from hanging forever on a fresh fd. The user runs `echo` first (which blocks during vLLM call), then `cat` reads the already-available response.
+- **Architecture x86_64 hardcoded**: `init_uts_ns` is opaque in kernel Rust bindings, so machine arch can't be read at runtime. Hardcoded since module only targets x86_64.
+- **compile-time kernel version**: `linux_banner` is not exported to modules. Kbuild generates the version at compile time from `KERNELRELEASE`, which is always correct (module won't load on mismatched kernel).
+
+### Files Changed
+
+- `hackbot-kmod/hackbot.rs` — Major rewrite: global response buffer, kernel context gathering, system prompt (460 → 700 lines)
+- `hackbot-kmod/Kbuild` — Added kernel_version.rs generation rule
+- `hackbot-kmod/.gitignore` — New: excludes build artifacts and generated files
+
+---
+
 ## Next Steps
 
-### Phase 2 — Complex Plane Signal View
-- `hackbot-signal` crate: sliding window, feature extraction, z(t) = r(t) * exp(i * theta(t))
-- Frontend: Canvas 2D orbit plot + phase diagram panel
-- Anomaly detection: EMA + standard deviation threshold
+### Step 2c — Dynamic Agent Loop with Kernel Tools (OODA)
 
-### In-Kernel LLM — System 1/System 2 Hybrid Architecture
+The current system is **static**: the LLM gets a fixed snapshot and gives one response. Step 2c makes it **dynamic**: the LLM can request specific kernel data, reason about it, and request more — a multi-step investigation loop.
 
-**Architecture decided** (see `docs/PLAN.md` Appendix B + C for full analysis):
+- Implement kernel observation tools (`ps`, `dmesg`, `mem`, `proc`, `mods`)
+- Add tool-call parsing: detect `<tool>name args</tool>` in LLM output
+- Agent loop in `vllm_complete`: prompt → vLLM → parse → execute tool → re-prompt
+- Bounded iterations (max 5) + total timeout
+- Read-only (Tier 0) — no action capability yet
+- **Prerequisite**: instruction-following model on keti (OPT-125M can't do tool use)
 
-- **System 1 (Spinal Cord)**: Tiny INT8 model (~1-33M params) running purely in-kernel. Instant pattern matching and anomaly reflexes. No network, no external dependency.
-- **System 2 (Brain)**: Large model (phi4-mini/Llama 3) via kernel socket → vLLM/ollama. Deep reasoning, analysis, planning. GPU-accelerated, 20-50 tok/s.
-- **Biological analogy**: Like a knee-jerk reflex — the body reacts BEFORE the brain understands why. System 1 alerts instantly, System 2 explains after 50-500ms.
+### Step 3 — In-Kernel INT8 Inference (System 1)
 
-**Implementation steps**:
-1. Step 1: `/dev/hackbot` module skeleton — **DONE**
-2. Step 2a: Kernel socket → ollama/vLLM (System 2, working agent fast)
-3. Step 2b: In-kernel INT8 inference (System 1, research challenge)
-4. Step 2c: Merge into hybrid System 1/2
+- Tiny model (~1-33M params) in `vmalloc` kernel memory
+- CPU inference via `kernel_fpu_begin/end` + AVX
+- Uses the SAME tool interface as Step 2c
+- Always-on anomaly detection, no network dependency
 
-**Safety**: Tiered capability system (Tier 0: observe → Tier 3: modify kernel). System 1 limited to Tier 0-1 (safe). System 2 can request Tier 2 (requires human approval). Tier 3 requires Verus verification. Defense in depth: Rust type system → capability boundary → eBPF verifier → Verus proofs.
+### Architecture Context
 
-**3D rendering**: Agent behavior maps to game world — reflexes as instant visual flashes, reasoning as delayed speech bubbles. Two-speed feedback creates compelling rhythm.
+See `docs/PLAN.md` Appendix B for the System 1/2 hybrid architecture analysis. Key insight (2026-03-20): inference substrate (WHERE) and agent capability (WHAT) are orthogonal axes. Build OODA tools first (Step 2c), then swap inference backend (Step 3).
+
+**Safety**: Tiered capability system (Tier 0: observe → Tier 3: modify kernel). Steps 2c-3 are Tier 0 only (read-only observation). Action capabilities (Tier 1+) deferred to Step 5, requiring Verus verification.
 
 ## Research: GPU/NPU Compute from Kernel Space (Linux 6.19.8)
 

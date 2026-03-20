@@ -1,7 +1,7 @@
 # hackbot Implementation Plan
 
-**Date**: 2026-03-02 (updated 2026-03-08)
-**Status**: Phase 1 complete (Python), rewriting backend to Rust
+**Date**: 2026-03-02 (updated 2026-03-20)
+**Status**: Phase 1 complete, in-kernel LLM through Step 2b (kernel-aware inference)
 **Guiding Principle**: Visualization-first MVP, Rust backend for Verus alignment
 
 ---
@@ -445,6 +445,8 @@ hackbot/
 
 Verus can formally verify Rust code, aligning with Pillar 4 (mathematical self-improvement). WASM runtimes exist in kernel space (kernel-wasm/Wasmer, Wasmjit, Camblet/wasm3) — could provide sandboxed execution for dynamic kernel-space code without native module risks. Worth investigating as an execution sandbox for the agent's action layer.
 
+See **Appendix D: WASM in Kernel — Future Exploration** for analysis of potential WASM use cases (inference sandbox, action sandbox, plugin system). Decision deferred — attractive but adds complexity. Revisit after System 1/2 hybrid is working.
+
 ### Concern 2: In-Kernel LLM (Research Direction)
 
 See **Appendix B: In-Kernel LLM Feasibility Analysis** for a detailed technical assessment and **Appendix C: Hybrid eBPF + Kernel Module Architecture** for the refined approach.
@@ -688,19 +690,64 @@ Investigated in Linux 6.19.8: **zero kernel-internal APIs exist for GPU/NPU comp
     └── Can REQUEST Tier 2+ actions (requires human approval)
 ```
 
+**Two Independent Axes** (key insight, 2026-03-20):
+
+The in-kernel LLM has two orthogonal design dimensions:
+
+1. **Inference substrate** — WHERE the brain runs (in-kernel CPU vs remote GPU)
+2. **Agent capability** — WHAT the brain can DO (static Q&A vs dynamic OODA tool use)
+
+```
+                        WHERE the brain runs
+                        ────────────────────
+                        In-kernel INT8          Remote vLLM
+                        (System 1)              (System 2)
+                        │                       │
+ WHAT it          ──────┼───────────────────────┼──────────────
+ can DO                 │                       │
+                        │                       │
+ Static                 │  Brain in a jar:      │  Step 2b (DONE):
+ (fixed context)        │  fast pattern match   │  smart model +
+                        │  but can't look       │  kernel context
+                        │  around               │  but static
+                        │                       │
+ Dynamic                │  THE DREAM:           │  Step 2c (NEXT):
+ (OODA + tools)         │  autonomous agent,    │  smart + can
+                        │  instant + capable    │  investigate, but
+                        │                       │  100ms+ per step
+```
+
+Build **OODA tools first** because they define the interface BOTH systems use. Then swap the inference backend from remote to local. Building INT8 without tools gives you a fast brain that can't do anything.
+
 **Implementation Steps**:
 
-| Step | What | Architecture | Duration |
-|------|------|-------------|----------|
+| Step | What | Architecture | Status |
+|------|------|-------------|--------|
 | **1** | Kernel module skeleton: `/dev/hackbot` + prompt/response | Infrastructure | **DONE** |
-| **2a** | Kernel socket client → ollama/vLLM (System 2 brain) | B | 1 week |
-| **2b** | Tiny in-kernel INT8 inference engine (System 1 reflex) | A | 2-3 weeks |
-| **2c** | Merge: System 1 handles fast decisions, System 2 handles deep analysis | D | 1 week |
-| **3** | Observation layer: read task_struct, attach kprobes | All | 1-2 weeks |
-| **4** | Action capability system with tiered safety | All | 1-2 weeks |
-| **5** | 3D game rendering of agent behavior | Frontend | 2-3 weeks |
+| **2a** | Kernel socket → vLLM (System 2 brain) | B | **DONE** |
+| **2b** | Kernel context injection (live system state in prompt) | B | **DONE** |
+| **2c** | Dynamic agent loop + kernel tools (OODA) | B | **NEXT** |
+| **3** | In-kernel INT8 inference engine (System 1 reflex) | A | Research |
+| **4** | Hybrid System 1/2 merge | D | After 2c + 3 |
+| **5** | Action capabilities with Verus-verified safety | All | Research |
+| **6** | 3D game rendering of agent behavior | Frontend | After 4 |
 
-Step 2a comes first because it gives us a **working, useful agent in days**. Step 2b runs in parallel as a research challenge. Step 2c merges them into the hybrid.
+**Step 2c details** — the OODA agent loop:
+- Kernel implements observation tools (`ps`, `dmesg`, `mem`, `proc`, `mods`)
+- LLM generates `<tool>name args</tool>` tags to request kernel data
+- Agent loop in `vllm_complete`: prompt → vLLM → parse → if tool call, execute + re-prompt
+- Bounded iterations (max 5) + total timeout to prevent runaway
+- Read-only (Tier 0) tools first — no action capability yet
+- Tool interface is model-agnostic: works with both System 1 (INT8) and System 2 (vLLM)
+
+**Step 3 details** — in-kernel INT8 (System 1):
+- Tiny model (~1-33M params) in `vmalloc` kernel memory
+- CPU inference via `kernel_fpu_begin/end` + AVX/SSE
+- Uses the SAME tool interface as Step 2c
+- Always-on anomaly detection, no network dependency
+- This is the substrate swap: remote GPU → local CPU, tools stay the same
+
+**Why OODA before INT8**: The tool interface (Step 2c) is foundational — it defines what the agent CAN DO regardless of where inference runs. INT8 (Step 3) is a performance optimization of where inference runs. We validate the tool architecture with remote vLLM first (easier debugging, smarter model), then swap in the local INT8 engine later.
 
 ### Action Safety: Tiered Capability System
 
@@ -945,3 +992,49 @@ The user's existing eBPF tracer project can be directly integrated:
 - Research tool for kernel security analysis
 
 Both modes share the same infrastructure. The difference is the LLM's objective and the visualization emphasis.
+
+---
+
+## Appendix D: WASM in Kernel — Future Exploration
+
+**Date**: 2026-03-18
+**Status**: Deferred. Attractive but adds architectural complexity. Revisit after System 1/2 hybrid is working.
+
+### Existing Kernel WASM Runtimes
+
+| Runtime | Origin | Interpreter | Status |
+|---------|--------|-------------|--------|
+| **Camblet (wasm3)** | Cisco | wasm3 (fast interpreter) | Production-proven, security-focused |
+| **kernel-wasm** | Community | Wasmer | Research-stage |
+| **Wasmjit** | Community | Custom JIT | Older, less maintained |
+
+### Potential Use Cases for hackbot
+
+**1. Inference Sandbox (System 1)**
+Compile the INT8 inference engine to WASM. The WASM linear memory model gives memory safety by construction — a buggy inference kernel can't corrupt kernel data structures. Import list = capability boundary (only what the host explicitly provides).
+
+**2. Action Sandbox**
+More expressive than eBPF for complex agent actions. WASM programs can loop, allocate, and call imported functions — while still being sandboxed. Import validation at load time: if `kill_process` isn't in the import list, WASM code physically cannot call it. Complementary to eBPF verifier (eBPF for observation probes, WASM for complex actions).
+
+**3. Plugin System**
+Hot-swappable analysis modules without reloading the kernel module. Users could write custom anomaly detectors compiled to WASM and load them at runtime.
+
+**4. Defense in Depth Stack**
+```
+Rust type system → WASM sandbox → WASM import validation → eBPF verifier → Verus proofs
+```
+Each layer catches different classes of bugs. WASM adds a runtime isolation layer that Rust's compile-time checks can't provide for dynamically loaded code.
+
+### Why Deferred
+
+- Adds a third execution model (native Rust + eBPF + WASM) — increases cognitive and build complexity
+- System 1/2 hybrid is already complex enough as the next step
+- WASM integer-only limitation (no native FPU) may require special handling for inference
+- The value becomes clearer once we have a working agent with real action requirements
+- Better to prove the architecture works first, then add sandboxing layers
+
+### When to Revisit
+
+- After Step 2a (kernel socket → vLLM) is working
+- When the action layer needs more expressiveness than eBPF allows
+- If System 1 in-kernel inference needs stronger isolation guarantees

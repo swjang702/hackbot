@@ -21,3 +21,8 @@
 
 /task_easy. Ok good. one thing changed: build against linux source code here @~/sources/linux-6.19.8 . would you proceed carefully? if there are any concerns, please let me know.
 
+/task_easy hmm. wasm looks attractive. but one thing I'm worrying about is putting it makes hackbot too complicated. let's update wasm information a little bit and think more about it later. now let's get back to our work. how do you think?
+
+/task_easy Looks good. please proceed the plan carefully. and I want to go with vLLM.
+
+/task_easy cool. But currently I have one issue. the host has no nvidia gpu and poor computing resources. thus, is it possible for in-kernel llm to connect not to local vllm but other vllm in other network of host? how do you think this problem?
