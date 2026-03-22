@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - The file \@general_index.md contains a list of all the files in the codebase along with a simple description of what it does.
     - The file \@detailed_index.md contains the names of all the functions in the file along with its explanation/docstring.
     This index may or may not be up to date.
+- You can take a quick look the vllm/ and the linux-6.19.8/ directories.
 
 ## Project Overview
 

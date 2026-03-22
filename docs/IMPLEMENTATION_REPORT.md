@@ -326,18 +326,149 @@ read("/dev/hackbot")
 
 ---
 
+## Step 2c: Dynamic OODA Agent Loop with Kernel Tools
+
+**Status**: Implementation complete (builds successfully)
+**Date**: 2026-03-20
+
+### Overview
+
+Step 2c transforms hackbot from a static single-shot responder into a dynamic agent with an OODA (Observe-Orient-Decide-Act) loop. The LLM can now request specific kernel data via tool calls, reason about it, and request more — a multi-turn investigation loop entirely within kernel space.
+
+### Architecture
+
+```
+write("/dev/hackbot", prompt)
+  → hackbot.ko: agent_loop(prompt)
+      Build conversation:
+        [System Identity + Tool Description]
+        [=== LIVE KERNEL STATE ===]
+        [User: <prompt>]
+        [hackbot: ]
+
+      OODA Loop (max 10 iterations):
+        ┌─→ vllm_call(conversation) → HTTP POST to keti
+        │   Parse response for <tool>name</tool>
+        │   ├── Tool call detected:
+        │   │   execute_tool(name) → kernel API call
+        │   │   Append: reasoning + [Tool: name] output [End Tool]
+        │   │   Continue loop ──────────────────────────┘
+        │   └── No tool call (final answer):
+        │       Return response text
+        └── Max iterations → return accumulated text
+
+read("/dev/hackbot")
+  → read from global RESPONSE buffer
+```
+
+### Kernel Observation Tools (Tier 0 — Read-Only)
+
+Three tools available to the LLM, all using ring 0 kernel APIs:
+
+| Tool | Kernel API | Output |
+|------|-----------|--------|
+| `ps` | `init_task.tasks` two-pass walk under RCU | PID, PPID, state, comm — user-space first, kernel threads second (up to 512 tasks) |
+| `mem` | `si_meminfo()` | Total/free/used/shared/buffers RAM + swap stats |
+| `loadavg` | `avenrun[]` (EXPORT_SYMBOL) | 1/5/15 min load averages + CPU count + uptime |
+
+**Tool Call Protocol**: The LLM outputs `<tool>name</tool>` to request data. vLLM's `stop` parameter is set to `["</tool>"]` so generation halts cleanly at the tool boundary. The parser also handles the case where the stop sequence strips the closing tag.
+
+### Key Implementation Details
+
+**Agent Loop** (`agent_loop()`):
+- Replaces the single-shot `vllm_complete()` from Step 2b
+- Uses `/v1/chat/completions` API with structured JSON messages array (system/user/assistant roles)
+- vLLM applies the correct chat template automatically (ChatML for Qwen, etc.)
+- Messages built incrementally via `append_message_to_json()` helper
+- Loops: vLLM call → parse → tool dispatch → append assistant+user messages → re-prompt
+- Bounded by `MAX_AGENT_ITERATIONS` (10) and `MAX_CONVERSATION_SIZE` (48 KB)
+- Request includes `temperature: 0.6` and `repetition_penalty: 1.1` to reduce degenerate outputs
+- Graceful degradation: if the model doesn't generate tool calls, returns the first response as final answer
+
+**Tool Call Parser** (`parse_tool_call()`):
+- Scans for `<tool>NAME</tool>` pattern using existing `find_subsequence()`
+- Also handles `<tool>NAME` without closing tag (vLLM stop sequence removes it)
+- Returns `ToolCallResult::ToolCall { name, prefix }` or `ToolCallResult::FinalAnswer(text)`
+- `prefix` captures LLM reasoning before the tool call (included in conversation history)
+
+**Process List Tool** (`tool_ps()`):
+- Two-pass walk of `init_task.tasks` linked list under RCU protection:
+  - **Pass 1**: User-space processes (`task->mm != NULL`) — ensures `bash`, `sleep`, etc. appear first
+  - **Pass 2**: Kernel threads (`task->mm == NULL`) — `kswapd`, `ksoftirqd`, etc.
+- Uses `core::mem::offset_of!(task_struct, tasks)` for container_of pattern
+- Protected by `kernel::sync::rcu::Guard` (RAII RCU read-side lock)
+- `format_task()` helper reads: `pid`, `real_parent->pid`, `__state`, `comm` from each `task_struct`
+- State decoding: R (running), S (interruptible), D (uninterruptible), T (stopped/traced), Z (zombie), X (dead), I (idle)
+- Bounded to `MAX_PS_TASKS` (512), with `MAX_TOOL_OUTPUT` (8 KB) as secondary truncation
+- **Bug fix (2026-03-22)**: Original single-pass walk showed only kernel threads because `init_task.tasks` is creation-ordered (kernel threads first). With `MAX_PS_TASKS=64`, user-space processes were never reached. Two-pass walk ensures user-space processes are always visible.
+
+**Load Average Tool** (`tool_loadavg()`):
+- `avenrun[]` is EXPORT_SYMBOL but not in bindgen output for out-of-tree modules
+- Declared manually as `extern "C" { static avenrun: [c_ulong; 3]; }`
+- Fixed-point conversion: FSHIFT=11, so `integer = val / 2048`, `frac = (val % 2048) * 100 / 2048`
+- Reads via `ptr::read_volatile()` for atomic semantics
+
+**Conversation Format** (multi-turn via chat completions API):
+```json
+[
+  {"role": "system", "content": "<system identity + tool description + live kernel context>"},
+  {"role": "user", "content": "what's consuming memory?"},
+  {"role": "assistant", "content": "Let me check the processes. <tool>ps</tool>"},
+  {"role": "user", "content": "[Tool: ps]\nPID PPID STATE COMM\n1 0 S systemd\n...\n[End Tool]\nUse the tool output above to answer the user's question."},
+  {"role": "assistant", "content": "Based on the process list, ..."}
+]
+```
+
+**vLLM API (chat completions)**:
+- Uses `/v1/chat/completions` endpoint (not `/v1/completions`) — vLLM applies chat template automatically
+- `build_vllm_request()` takes pre-built JSON messages array
+- `append_message_to_json()` incrementally builds the array (truncate `]`, append `,{...}]`)
+- Request body: `{"model":"<auto-discovered>","messages":[...],"max_tokens":512,"temperature":0.6,"repetition_penalty":1.1,"stop":["</tool>"]}`
+- Each iteration makes a new TCP connection (Connection: close), keeping things simple
+- `extract_text_from_json()` looks for `"content":"` pattern (chat completions response format)
+
+### Design Decisions
+
+- **XML tool tags over JSON**: `<tool>name</tool>` is simpler to parse and simpler for small models to generate than JSON function calls. No escaping issues.
+- **Stop sequence `</tool>`**: Prevents the LLM from generating fake tool output after a tool call. The model generates `<tool>ps`, vLLM stops, we execute the real tool and inject its output.
+- **Single tool per iteration**: Parsing only the first `<tool>` tag keeps the loop simple and predictable. Multiple tools per turn adds complexity with minimal benefit.
+- **Chat completions over raw completions**: Instruct/chat models (Qwen, Llama, etc.) require proper role tokens to engage instruction-following behavior. Raw `/v1/completions` leads to degenerate text completion (hallucinated conversations, repetition loops). `/v1/chat/completions` applies the chat template automatically.
+- **Structured messages**: Each iteration appends assistant + user messages to a JSON array. Bounded by MAX_CONVERSATION_SIZE (48 KB). The assistant message includes reasoning prefix to maintain chain-of-thought.
+- **Graceful model degradation**: If the model never generates `<tool>` tags (e.g., OPT-125M base model), the loop exits on iteration 1 with a FinalAnswer — functionally identical to Step 2b.
+- **Tool-call loop prevention**: Force final answer on last iteration — execute the tool and return raw output rather than empty "max iterations" message. Aggressive nudge prompts ("Do NOT call more tools") were tested and **removed** — they restrict the model's action space and produce worse results (placeholder output from 7B-AWQ). Permissive prompts work better: "Now analyze this data and answer the user's question."
+- **Model auto-discovery**: `discover_model_name()` queries vLLM's `/v1/models` endpoint to get the actual served model name, so the module works with any model without hardcoding.
+- **No few-shot conversation messages**: Few-shot examples as conversation messages caused the model to confuse example data with real historical data (referencing fake PIDs from examples). Format examples are placed inside the system prompt as instructional text instead.
+- **RCU for task list**: The `kernel::sync::rcu::Guard` provides RAII RCU read-side protection. Tasks can't be freed while we're iterating.
+- **No timeout (yet)**: Each vLLM call has an implicit TCP timeout. A total wall-clock timeout would require `ktime_get_boot_fast_ns()` tracking — deferred to avoid complexity.
+
+### Files Changed
+
+- `hackbot-kmod/hackbot.rs` — Major additions: tool infrastructure, 3 kernel tools, agent loop, two-pass ps (700 → ~1476 lines)
+
+### Model Compatibility & Testing
+
+| Model | Status | Notes |
+|-------|--------|-------|
+| `facebook/opt-125m` | Works (no tools) | Base model, no instruction-following. Degrades gracefully to Step 2b behavior. |
+| `Qwen/Qwen2.5-1.5B-Instruct` | Partial | Follows tool format sometimes, but unreliable. Required switch to chat completions. |
+| `Qwen/Qwen2.5-7B-Instruct-AWQ` | **Recommended** | Reliably calls tools, follows protocol. Occasional looping (handled by force-final-answer). |
+
+```bash
+# On keti:
+vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --port 8000
+```
+
+### Lessons Learned (Prompt Engineering for Small Models)
+
+1. **Don't restrict action space**: Nudge prompts like "Do NOT call any more tools" make 7B models produce placeholder output instead of analysis. Use permissive prompts.
+2. **Don't use few-shot conversation messages**: Models confuse example data with real historical data. Put format examples in the system prompt as instructional text.
+3. **Data quality > iteration count**: If the tool returns incomplete data, more loop iterations won't help. Fix the data source.
+4. **Chat completions, not raw completions**: Instruct models require `/v1/chat/completions` with role tokens. Raw `/v1/completions` produces degenerate text completion.
+5. **Tools last in system prompt**: Small models pay more attention to the end of the system prompt (recency bias). Place tool descriptions after kernel context.
+
+---
+
 ## Next Steps
-
-### Step 2c — Dynamic Agent Loop with Kernel Tools (OODA)
-
-The current system is **static**: the LLM gets a fixed snapshot and gives one response. Step 2c makes it **dynamic**: the LLM can request specific kernel data, reason about it, and request more — a multi-step investigation loop.
-
-- Implement kernel observation tools (`ps`, `dmesg`, `mem`, `proc`, `mods`)
-- Add tool-call parsing: detect `<tool>name args</tool>` in LLM output
-- Agent loop in `vllm_complete`: prompt → vLLM → parse → execute tool → re-prompt
-- Bounded iterations (max 5) + total timeout
-- Read-only (Tier 0) — no action capability yet
-- **Prerequisite**: instruction-following model on keti (OPT-125M can't do tool use)
 
 ### Step 3 — In-Kernel INT8 Inference (System 1)
 

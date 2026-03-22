@@ -2,11 +2,18 @@
 
 //! hackbot — In-kernel LLM agent character device.
 //!
-//! Step 2b: Kernel-aware LLM agent with live system context injection.
+//! Step 2c: Dynamic OODA agent with kernel observation tools.
 //! The module creates /dev/hackbot: write a prompt, read the LLM response.
-//! Before each vLLM call, the module gathers live kernel state (version,
-//! uptime, CPU count, memory, caller process) and injects it into the prompt
-//! so the LLM can reason about the actual system.
+//! The LLM can request kernel data via tool calls (`<tool>name</tool>`),
+//! creating a multi-turn Observe-Orient-Decide-Act loop:
+//!
+//!   prompt → vLLM → parse response → if tool call: execute tool → re-prompt
+//!   ...repeat until final answer or max iterations (5)
+//!
+//! Available tools (Tier 0 — read-only observation):
+//!   ps      — List running processes (PID, PPID, state, comm)
+//!   mem     — Detailed memory statistics (total, free, buffers, swap)
+//!   loadavg — System load averages (1/5/15 min) and task counts
 //!
 //! The response is stored in a device-global buffer so that separate write and
 //! read file descriptors work correctly (e.g., `echo > /dev/hackbot` then
@@ -14,17 +21,17 @@
 //!
 //! Usage:
 //! ```sh
-//! # Start vLLM server first (userspace):
-//! # vllm serve <model-name> --port 8000
+//! # Start vLLM server first (userspace) — needs instruction-following model:
+//! # vllm serve Qwen/Qwen2.5-7B-Instruct --port 8000
 //!
 //! sudo insmod hackbot.ko
-//! echo "what processes are running?" > /dev/hackbot
+//! echo "what processes are using the most memory?" > /dev/hackbot
 //! cat /dev/hackbot
-//! # Output: LLM-generated response from vLLM
+//! # Output: LLM-generated response (may involve multiple tool calls)
 //! sudo rmmod hackbot
 //! ```
 
-use core::mem::MaybeUninit;
+use core::mem::{self, MaybeUninit};
 use core::pin::Pin;
 use core::ptr;
 
@@ -36,13 +43,14 @@ use kernel::{
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
     prelude::*,
     sync::aref::ARef,
+    sync::rcu,
 };
 
 module! {
     type: HackbotModule,
     name: "hackbot",
     authors: ["Sunwoo Jang"],
-    description: "In-kernel LLM agent — Step 2b: kernel-aware inference with live context",
+    description: "In-kernel LLM agent — Step 2c: OODA agent loop with kernel tools",
     license: "GPL",
 }
 
@@ -50,13 +58,13 @@ module! {
 // Configuration constants
 //
 // vLLM server address — change VLLM_ADDR to point to the target machine.
-// Currently: 100.125.213.42 (Tailscale IP for ubuntu20/keti GPU server).
 // NOTE: Tailscale traffic is encrypted (WireGuard), so plaintext HTTP is fine.
 // ---------------------------------------------------------------------------
 
 /// vLLM server IPv4 address in host byte order.
-/// Currently: 100.125.213.42 (keti GPU server via Tailscale).
-const VLLM_ADDR: u32 = u32::from_be_bytes([100, 125, 213, 42]);
+/// 100.125.213.42 (keti ubuntu server via Tailscale).
+/// Currently: 100.66.136.70 (keti GPU server via Tailscale).
+const VLLM_ADDR: u32 = u32::from_be_bytes([100, 66, 136, 70]);
 /// vLLM server port (default: 8000, matching vLLM's default).
 const VLLM_PORT: u16 = 8000;
 /// Maximum response size from vLLM (64 KB).
@@ -66,19 +74,57 @@ const RECV_BUF_SIZE: usize = 4096;
 /// IPPROTO_TCP (stable since RFC 793).
 const IPPROTO_TCP: i32 = 6;
 
-/// System prompt — the agent's identity. Kernel context is injected after this.
-const SYSTEM_IDENTITY: &[u8] = b"You are hackbot, an autonomous AI agent running \
-as a Linux kernel module at ring 0. You have direct access to kernel internals \
-and can observe the live state of the system. The kernel context below is REAL \
-data gathered directly from kernel APIs at the moment of this query. Use it to \
-give accurate, grounded answers.\n\n";
+/// Maximum number of agent loop iterations (tool calls).
+/// 10 gives enough room for multi-tool queries with 7B+ models.
+const MAX_AGENT_ITERATIONS: usize = 10;
+/// Maximum number of processes to list in the `ps` tool output.
+/// High limit — actual truncation is handled by MAX_TOOL_OUTPUT (8 KB).
+const MAX_PS_TASKS: usize = 512;
+/// Maximum size for a single tool output (8 KB).
+const MAX_TOOL_OUTPUT: usize = 8 * 1024;
+/// Maximum conversation size sent to vLLM (48 KB). Prevents unbounded prompt growth.
+const MAX_CONVERSATION_SIZE: usize = 48 * 1024;
 
-/// Suffix appended after the user prompt to guide the model's response.
-const RESPONSE_PREFIX: &[u8] = b"\nhackbot: ";
+/// System prompt — the agent's identity. Concise for small models.
+const SYSTEM_IDENTITY: &[u8] = b"You are hackbot, an AI running inside the Linux kernel. \
+You have tools to observe live system state. ALWAYS use tools -- never guess or make up data.\n\n";
+
+/// Tool description -- structured with format example inside the system prompt.
+/// The example is instructional text, NOT conversation history, so the model
+/// won't confuse it with real data.
+const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- output the exact XML tag to call a tool:\n\
+  <tool>ps</tool>      - list running processes (PID, PPID, state, command)\n\
+  <tool>mem</tool>     - detailed memory statistics\n\
+  <tool>loadavg</tool> - system load averages\n\n\
+FORMAT EXAMPLE:\n\
+  User: what is the system load?\n\
+  You respond with ONLY: <tool>loadavg</tool>\n\
+  You then receive the real tool output and summarize it for the user.\n\n\
+RULES:\n\
+- When asked about processes, memory, or load: ALWAYS call the relevant tool FIRST\n\
+- Respond with ONLY the <tool> tag -- no other text before it\n\
+- After receiving tool output, provide a clear summary to the user\n\
+- NEVER reference example data -- always call tools to get real, live data\n";
+
+// Note: RESPONSE_PREFIX removed — chat completions API handles turn-taking
+// via the messages array structure (system/user/assistant roles).
 
 // Kernel version string, auto-generated by Kbuild from KERNELRELEASE.
 #[path = "kernel_version.rs"]
 mod kernel_version;
+
+// avenrun[] is EXPORT_SYMBOL but not included in bindgen output for
+// out-of-tree modules. Declare it manually.
+extern "C" {
+    /// Load averages as fixed-point unsigned long[3] (FSHIFT=11).
+    /// Defined in kernel/sched/loadavg.c, EXPORT_SYMBOL(avenrun).
+    static avenrun: [core::ffi::c_ulong; 3];
+}
+// Compile-time check: avenrun declaration assumes 64-bit unsigned long.
+const _: () = assert!(
+    core::mem::size_of::<core::ffi::c_ulong>() == 8,
+    "avenrun extern assumes 64-bit unsigned long (x86_64 only)"
+);
 
 // ---------------------------------------------------------------------------
 // Global shared response buffer
@@ -266,6 +312,343 @@ fn append_current_task_info(buf: &mut KVVec<u8>) {
         let _ = buf.push(c as u8, GFP_KERNEL);
     }
     let _ = buf.extend_from_slice(b")", GFP_KERNEL);
+}
+
+// ---------------------------------------------------------------------------
+// Tool call parser — detects <tool>name</tool> in LLM output
+// ---------------------------------------------------------------------------
+
+/// Result of parsing an LLM response for tool calls.
+enum ToolCallResult<'a> {
+    /// The LLM wants to call a tool. `name` is the tool name, `prefix` is any
+    /// text before the tool tag (the LLM's reasoning).
+    ToolCall { name: &'a [u8], prefix: &'a [u8] },
+    /// No tool call detected — this is the final answer.
+    FinalAnswer(&'a [u8]),
+}
+
+/// Parse an LLM response looking for a `<tool>NAME</tool>` tag.
+/// Also handles the case where vLLM stopped at `</tool>` (stop sequence),
+/// so the response contains `<tool>NAME` without the closing tag.
+/// Returns the first tool call found, or the full text as a final answer.
+fn parse_tool_call(response: &[u8]) -> ToolCallResult<'_> {
+    let open_tag = b"<tool>";
+
+    if let Some(open_pos) = find_subsequence(response, open_tag) {
+        let content_start = open_pos + open_tag.len();
+        let remaining = &response[content_start..];
+
+        // Try to find </tool> closing tag first.
+        let close_tag = b"</tool>";
+        let name_end = if let Some(close_offset) = find_subsequence(remaining, close_tag) {
+            close_offset
+        } else {
+            // No closing tag — vLLM stopped at </tool> stop sequence.
+            // The tool name is everything after <tool> until end or newline.
+            remaining
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+                .unwrap_or(remaining.len())
+        };
+
+        let name = trim_ascii(&remaining[..name_end]);
+        // Cap tool name length to prevent conversation bloat from LLM gibberish.
+        let name = if name.len() > 32 { &name[..32] } else { name };
+        if !name.is_empty() {
+            return ToolCallResult::ToolCall {
+                name,
+                prefix: &response[..open_pos],
+            };
+        }
+    }
+    ToolCallResult::FinalAnswer(response)
+}
+
+/// Trim leading and trailing ASCII whitespace from a byte slice.
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(s.len());
+    let end = s.iter().rposition(|&b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+    &s[start..end]
+}
+
+// ---------------------------------------------------------------------------
+// Kernel observation tools (Tier 0 — read-only)
+// ---------------------------------------------------------------------------
+
+/// Execute a tool by name and return its output.
+/// Unknown tools return an error message.
+fn execute_tool(name: &[u8]) -> KVVec<u8> {
+    let mut output = KVVec::new();
+
+    match name {
+        b"ps" => tool_ps(&mut output),
+        b"mem" => tool_mem(&mut output),
+        b"loadavg" => tool_loadavg(&mut output),
+        _ => {
+            let _ = output.extend_from_slice(b"[Error: unknown tool '", GFP_KERNEL);
+            let _ = output.extend_from_slice(name, GFP_KERNEL);
+            let _ = output.extend_from_slice(
+                b"'. Available tools: ps, mem, loadavg]\n",
+                GFP_KERNEL,
+            );
+        }
+    }
+
+    if output.is_empty() {
+        let _ = output.extend_from_slice(b"[No output]\n", GFP_KERNEL);
+    }
+
+    // Truncate if tool output exceeds limit. Reserve space for the suffix.
+    const TRUNCATION_SUFFIX: &[u8] = b"\n[... truncated]\n";
+    if output.len() > MAX_TOOL_OUTPUT - TRUNCATION_SUFFIX.len() {
+        output.truncate(MAX_TOOL_OUTPUT - TRUNCATION_SUFFIX.len());
+        let _ = output.extend_from_slice(TRUNCATION_SUFFIX, GFP_KERNEL);
+    }
+
+    output
+}
+
+/// Format a single task_struct into the ps output line.
+/// Caller must hold RCU read lock.
+///
+/// # Safety
+/// `task` must be a valid pointer to a task_struct under RCU protection.
+unsafe fn format_task(output: &mut KVVec<u8>, task: *const bindings::task_struct) {
+    // SAFETY: Caller guarantees task is valid under RCU protection.
+    let pid = unsafe { (*task).pid };
+    let ppid = unsafe {
+        let parent = (*task).real_parent;
+        if parent.is_null() { 0 } else { (*parent).pid }
+    };
+    let state = unsafe { (*task).__state };
+    let comm = unsafe { &(*task).comm };
+
+    let mut num = [0u8; 20];
+
+    // PID (8-wide)
+    let s = format_usize(pid as usize, &mut num);
+    let _ = output.extend_from_slice(s, GFP_KERNEL);
+    for _ in 0..(8usize.saturating_sub(s.len())) {
+        let _ = output.push(b' ', GFP_KERNEL);
+    }
+
+    // PPID (8-wide)
+    let s = format_usize(ppid as usize, &mut num);
+    let _ = output.extend_from_slice(s, GFP_KERNEL);
+    for _ in 0..(8usize.saturating_sub(s.len())) {
+        let _ = output.push(b' ', GFP_KERNEL);
+    }
+
+    // State character
+    let state_ch = match state {
+        0 => b'R',     // TASK_RUNNING
+        1 => b'S',     // TASK_INTERRUPTIBLE
+        2 => b'D',     // TASK_UNINTERRUPTIBLE
+        4 => b'T',     // __TASK_STOPPED
+        8 => b'T',     // __TASK_TRACED
+        0x40 => b'Z',  // EXIT_ZOMBIE
+        0x20 => b'X',  // EXIT_DEAD
+        0x402 => b'I', // TASK_IDLE
+        _ => b'?',
+    };
+    let _ = output.push(state_ch, GFP_KERNEL);
+    let _ = output.extend_from_slice(b"      ", GFP_KERNEL);
+
+    // Comm (null-terminated, up to 16 chars)
+    for &c in comm.iter() {
+        if c == 0 {
+            break;
+        }
+        let _ = output.push(c as u8, GFP_KERNEL);
+    }
+    let _ = output.push(b'\n', GFP_KERNEL);
+}
+
+/// Tool: `ps` — list running processes by walking the kernel task list.
+///
+/// Two-pass walk: user-space processes first (mm != NULL), then kernel threads.
+/// This ensures user processes (like `sleep`, `bash`) appear before kernel threads
+/// fill the output buffer, since kernel threads dominate the early task list.
+fn tool_ps(output: &mut KVVec<u8>) {
+    // Offset of `tasks` field within `task_struct` for container_of.
+    let tasks_offset = mem::offset_of!(bindings::task_struct, tasks);
+
+    // SAFETY: Acquire RCU read-side lock to protect against task_struct
+    // being freed while we iterate. The kernel guarantees that RCU-protected
+    // task_structs remain valid until after the grace period following our
+    // rcu_read_unlock (via Guard drop).
+    let _rcu = rcu::read_lock();
+
+    // init_task is a global exported symbol, always valid.
+    let init = ptr::addr_of!(bindings::init_task);
+    // SAFETY: init_task is always valid; reading its tasks field is safe.
+    let list_head = unsafe { ptr::addr_of!((*init).tasks) };
+
+    let mut count = 0usize;
+
+    // Pass 1: User-space processes (mm != NULL).
+    let _ = output.extend_from_slice(
+        b"=== User-Space Processes ===\nPID      PPID     STATE  COMM\n",
+        GFP_KERNEL,
+    );
+    // SAFETY: init_task.tasks.next points to the first real task's `tasks`
+    // list_head, or back to init_task.tasks if there are no other tasks.
+    let mut current = unsafe { (*list_head).next };
+    while current != list_head as *mut bindings::list_head && count < MAX_PS_TASKS {
+        let task = unsafe {
+            (current as *const u8).sub(tasks_offset) as *const bindings::task_struct
+        };
+        // SAFETY: task->mm is a pointer read; NULL means kernel thread.
+        // Under RCU, the task_struct (and its mm field) is valid.
+        let mm = unsafe { (*task).mm };
+        if !mm.is_null() {
+            // SAFETY: task is valid under RCU, format_task only reads fields.
+            unsafe { format_task(output, task) };
+            count += 1;
+        }
+        current = unsafe { (*current).next };
+    }
+
+    // Pass 2: Kernel threads (mm == NULL), if we still have room.
+    if count < MAX_PS_TASKS {
+        let _ = output.extend_from_slice(
+            b"\n=== Kernel Threads ===\nPID      PPID     STATE  COMM\n",
+            GFP_KERNEL,
+        );
+        current = unsafe { (*list_head).next };
+        while current != list_head as *mut bindings::list_head && count < MAX_PS_TASKS {
+            let task = unsafe {
+                (current as *const u8).sub(tasks_offset) as *const bindings::task_struct
+            };
+            let mm = unsafe { (*task).mm };
+            if mm.is_null() {
+                // SAFETY: task is valid under RCU, format_task only reads fields.
+                unsafe { format_task(output, task) };
+                count += 1;
+            }
+            current = unsafe { (*current).next };
+        }
+    }
+
+    if count >= MAX_PS_TASKS {
+        let _ = output.extend_from_slice(b"[... truncated]\n", GFP_KERNEL);
+    }
+
+    // _rcu guard dropped here → rcu_read_unlock()
+}
+
+/// Tool: `mem` — detailed memory statistics via si_meminfo().
+fn tool_mem(output: &mut KVVec<u8>) {
+    // SAFETY: si_meminfo() fills a stack-allocated sysinfo struct.
+    // Safe to call from process context.
+    let mut info: bindings::sysinfo = unsafe { MaybeUninit::zeroed().assume_init() };
+    unsafe { bindings::si_meminfo(&mut info) };
+
+    let unit = info.mem_unit as usize;
+    let total_mb = (info.totalram as usize * unit) / (1024 * 1024);
+    let free_mb = (info.freeram as usize * unit) / (1024 * 1024);
+    let used_mb = total_mb.saturating_sub(free_mb);
+    let shared_mb = (info.sharedram as usize * unit) / (1024 * 1024);
+    let buffers_mb = (info.bufferram as usize * unit) / (1024 * 1024);
+    let swap_total_mb = (info.totalswap as usize * unit) / (1024 * 1024);
+    let swap_free_mb = (info.freeswap as usize * unit) / (1024 * 1024);
+    let swap_used_mb = swap_total_mb.saturating_sub(swap_free_mb);
+
+    let mut num = [0u8; 20];
+
+    let _ = output.extend_from_slice(b"=== Memory Statistics ===\n", GFP_KERNEL);
+
+    // RAM
+    let _ = output.extend_from_slice(b"Total RAM:   ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(total_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    let _ = output.extend_from_slice(b"Used RAM:    ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(used_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    let _ = output.extend_from_slice(b"Free RAM:    ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(free_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    let _ = output.extend_from_slice(b"Shared:      ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(shared_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    let _ = output.extend_from_slice(b"Buffers:     ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(buffers_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    // Swap
+    let _ = output.extend_from_slice(b"Swap Total:  ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(swap_total_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    let _ = output.extend_from_slice(b"Swap Used:   ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(swap_used_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    let _ = output.extend_from_slice(b"Swap Free:   ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(swap_free_mb, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" MB\n", GFP_KERNEL);
+
+    // Usage percentage
+    if total_mb > 0 {
+        let pct = (used_mb * 100) / total_mb;
+        let _ = output.extend_from_slice(b"RAM Usage:   ", GFP_KERNEL);
+        let _ = output.extend_from_slice(format_usize(pct, &mut num), GFP_KERNEL);
+        let _ = output.extend_from_slice(b"%\n", GFP_KERNEL);
+    }
+}
+
+/// Tool: `loadavg` — system load averages from the kernel's avenrun[] array.
+///
+/// avenrun[] stores load averages as unsigned long in fixed-point format
+/// with FSHIFT=11 bits of precision (i.e., value * 2048).
+fn tool_loadavg(output: &mut KVVec<u8>) {
+    // FSHIFT=11, so divisor is 2048.
+    const FSHIFT: usize = 11;
+    const FIXED_1: usize = 1 << FSHIFT; // 2048
+
+    // SAFETY: avenrun is a global exported symbol (unsigned long[3]).
+    // Reading it is safe — the values are updated atomically by the scheduler.
+    let avg1 = unsafe { ptr::read_volatile(ptr::addr_of!(avenrun[0])) } as usize;
+    let avg5 = unsafe { ptr::read_volatile(ptr::addr_of!(avenrun[1])) } as usize;
+    let avg15 = unsafe { ptr::read_volatile(ptr::addr_of!(avenrun[2])) } as usize;
+
+    let mut num = [0u8; 20];
+
+    let _ = output.extend_from_slice(b"=== Load Averages ===\n", GFP_KERNEL);
+
+    // Format each as "X.XX"
+    for (label, val) in [
+        (b"1 min:   " as &[u8], avg1),
+        (b"5 min:   ", avg5),
+        (b"15 min:  ", avg15),
+    ] {
+        let _ = output.extend_from_slice(label, GFP_KERNEL);
+        let integer = val / FIXED_1;
+        let frac = (val % FIXED_1) * 100 / FIXED_1;
+        let _ = output.extend_from_slice(format_usize(integer, &mut num), GFP_KERNEL);
+        let _ = output.push(b'.', GFP_KERNEL);
+        // Zero-pad fractional part to 2 digits.
+        if frac < 10 {
+            let _ = output.push(b'0', GFP_KERNEL);
+        }
+        let _ = output.extend_from_slice(format_usize(frac, &mut num), GFP_KERNEL);
+        let _ = output.push(b'\n', GFP_KERNEL);
+    }
+
+    // Number of online CPUs for context.
+    let cpus = read_num_online_cpus();
+    let _ = output.extend_from_slice(b"Online CPUs: ", GFP_KERNEL);
+    let _ = output.extend_from_slice(format_usize(cpus, &mut num), GFP_KERNEL);
+    let _ = output.push(b'\n', GFP_KERNEL);
+
+    // Uptime for additional context.
+    let _ = output.extend_from_slice(b"Uptime:      ", GFP_KERNEL);
+    append_uptime(output);
+    let _ = output.push(b'\n', GFP_KERNEL);
 }
 
 // ---------------------------------------------------------------------------
@@ -529,27 +912,93 @@ fn json_escape(input: &[u8], output: &mut KVVec<u8>) {
     }
 }
 
-/// Build the HTTP POST request for vLLM's /v1/completions endpoint.
-/// `kernel_ctx` is the live kernel state to inject between the system
-/// identity and the user prompt.
-fn build_vllm_request(prompt: &[u8], kernel_ctx: &[u8]) -> Result<KVVec<u8>> {
-    // Build JSON body with structure:
-    //   <system identity>
-    //   <live kernel context>
-    //   User: <prompt>
-    //   hackbot:
+/// Append a chat message to a JSON messages array being built incrementally.
+/// The `messages` buffer holds a JSON array like `[{...},{...}]`.
+/// On first call (empty buffer), starts the array with `[`.
+///
+/// # Invariants
+/// - `role` must be a valid JSON-safe ASCII string (no quotes, backslashes, or control chars).
+///   Only use with: `b"system"`, `b"user"`, `b"assistant"`.
+/// - This function always leaves `messages` ending with `']'`, which is used
+///   to detect subsequent calls (truncate `]`, append `,{...}]`).
+fn append_message_to_json(messages: &mut KVVec<u8>, role: &[u8], content: &[u8]) {
+    if messages.last() == Some(&b']') {
+        // Remove trailing ']' and add comma separator.
+        messages.truncate(messages.len() - 1);
+        let _ = messages.extend_from_slice(b",", GFP_KERNEL);
+    } else {
+        // First message — start the array.
+        let _ = messages.extend_from_slice(b"[", GFP_KERNEL);
+    }
+    let _ = messages.extend_from_slice(b"{\"role\":\"", GFP_KERNEL);
+    let _ = messages.extend_from_slice(role, GFP_KERNEL);
+    let _ = messages.extend_from_slice(b"\",\"content\":\"", GFP_KERNEL);
+    json_escape(content, messages);
+    let _ = messages.extend_from_slice(b"\"}]", GFP_KERNEL);
+}
+
+/// Query vLLM's `/v1/models` endpoint to discover the served model name.
+/// Returns the model ID (e.g., `Qwen/Qwen2.5-1.5B-Instruct`) as bytes.
+/// vLLM requires the exact model name in chat completion requests.
+fn discover_model_name() -> Result<KVVec<u8>> {
+    let mut req = KVVec::new();
+    let _ = req.extend_from_slice(b"GET /v1/models HTTP/1.1\r\n", GFP_KERNEL);
+    let _ = req.extend_from_slice(b"Host: ", GFP_KERNEL);
+    append_ipv4(&mut req, VLLM_ADDR);
+    let _ = req.extend_from_slice(b"\r\nConnection: close\r\n\r\n", GFP_KERNEL);
+
+    let sock = KernelSocket::connect_tcp(VLLM_ADDR, VLLM_PORT)?;
+    sock.send_all(&req)?;
+
+    let mut raw_response = KVVec::new();
+    sock.recv_all(&mut raw_response, MAX_RESPONSE_SIZE)?;
+    drop(sock);
+
+    let status = parse_http_status(&raw_response);
+    if status != 200 {
+        pr_warn!("hackbot: /v1/models returned HTTP {}\n", status);
+        return Err(EIO);
+    }
+
+    let body = find_http_body(&raw_response);
+
+    // Extract model ID from {"data":[{"id":"MODEL_NAME",...}]}
+    // The first "id" field in the response is the model name.
+    let pattern = b"\"id\":\"";
+    let pos = find_subsequence(body, pattern).ok_or(EIO)?;
+    let value_start = pos + pattern.len();
+    let value_end = find_json_string_end(body, value_start).ok_or(EIO)?;
+
+    let model_name_raw = &body[value_start..value_end];
+    let mut model_name = KVVec::new();
+    // Unescape in case model name has JSON escapes (unlikely but correct).
+    json_unescape(model_name_raw, &mut model_name);
+
+    pr_info!(
+        "hackbot: discovered model: {}\n",
+        core::str::from_utf8(&model_name).unwrap_or("?"),
+    );
+
+    Ok(model_name)
+}
+
+/// Build the HTTP POST request for vLLM's /v1/chat/completions endpoint.
+/// `model_name` is the vLLM model name (from `discover_model_name()`).
+/// `messages_json` is a pre-built JSON array of chat messages.
+fn build_vllm_request(model_name: &[u8], messages_json: &[u8]) -> Result<KVVec<u8>> {
     let mut body = KVVec::new();
-    let _ = body.extend_from_slice(b"{\"prompt\":\"", GFP_KERNEL);
-    json_escape(SYSTEM_IDENTITY, &mut body);
-    json_escape(kernel_ctx, &mut body);
-    json_escape(b"User: ", &mut body);
-    json_escape(prompt, &mut body);
-    json_escape(RESPONSE_PREFIX, &mut body);
-    let _ = body.extend_from_slice(b"\",\"max_tokens\":512}", GFP_KERNEL);
+    let _ = body.extend_from_slice(b"{\"model\":\"", GFP_KERNEL);
+    json_escape(model_name, &mut body);
+    let _ = body.extend_from_slice(b"\",\"messages\":", GFP_KERNEL);
+    let _ = body.extend_from_slice(messages_json, GFP_KERNEL);
+    let _ = body.extend_from_slice(
+        b",\"max_tokens\":512,\"temperature\":0.6,\"repetition_penalty\":1.1,\"stop\":[\"</tool>\"]}",
+        GFP_KERNEL,
+    );
 
     // Build HTTP request with headers.
     let mut req = KVVec::new();
-    let _ = req.extend_from_slice(b"POST /v1/completions HTTP/1.1\r\n", GFP_KERNEL);
+    let _ = req.extend_from_slice(b"POST /v1/chat/completions HTTP/1.1\r\n", GFP_KERNEL);
     let _ = req.extend_from_slice(b"Host: ", GFP_KERNEL);
     append_ipv4(&mut req, VLLM_ADDR);
     let _ = req.extend_from_slice(b"\r\n", GFP_KERNEL);
@@ -632,8 +1081,12 @@ fn parse_http_status(raw: &[u8]) -> u16 {
 /// Looks for `"text":"` or `"text": "` and extracts the string value,
 /// handling escaped characters. Returns the raw bytes of the text content.
 fn extract_text_from_json<'a>(json: &'a [u8]) -> Option<&'a [u8]> {
-    // Find the "text" key. Try both with and without space after colon.
-    let patterns: &[&[u8]] = &[b"\"text\":\"", b"\"text\": \""];
+    // Chat completions: {"choices":[{"message":{"content":"..."}}]}
+    // Completions (fallback): {"choices":[{"text":"..."}]}
+    let patterns: &[&[u8]] = &[
+        b"\"content\":\"", b"\"content\": \"",
+        b"\"text\":\"", b"\"text\": \"",
+    ];
 
     let (start_pos, pat_len) = patterns.iter().find_map(|pat| {
         find_subsequence(json, pat).map(|pos| (pos, pat.len()))
@@ -665,7 +1118,7 @@ fn find_json_string_end(json: &[u8], start: usize) -> Option<usize> {
     while i < json.len() {
         match json[i] {
             b'"' => return Some(i),
-            b'\\' => i += 2, // Skip escaped character.
+            b'\\' => i = i.saturating_add(2), // Skip escaped character.
             _ => i += 1,
         }
     }
@@ -722,7 +1175,7 @@ fn process_prompt(prompt: &[u8]) -> KVVec<u8> {
         return r;
     }
 
-    match vllm_complete(prompt_trimmed) {
+    match agent_loop(prompt_trimmed) {
         Ok(mut text) => {
             // Ensure response ends with newline.
             if text.last() != Some(&b'\n') {
@@ -754,36 +1207,24 @@ fn process_prompt(prompt: &[u8]) -> KVVec<u8> {
     }
 }
 
-/// Connect to vLLM, send the prompt, and return the completion text.
-/// Gathers live kernel context and injects it into the prompt.
-fn vllm_complete(prompt: &[u8]) -> Result<KVVec<u8>> {
-    // Gather live kernel state to inject into the prompt.
-    let kernel_ctx = gather_kernel_context();
+/// Send a single chat completion request to vLLM and return the extracted text.
+/// `model_name` is the vLLM model name. `messages_json` is a pre-built JSON messages array.
+fn vllm_call(model_name: &[u8], messages_json: &[u8]) -> Result<KVVec<u8>> {
+    let request = build_vllm_request(model_name, messages_json)?;
 
-    // Build the HTTP request with system identity + kernel context + user prompt.
-    let request = build_vllm_request(prompt, &kernel_ctx)?;
-
-    // Connect to vLLM.
     let sock = KernelSocket::connect_tcp(VLLM_ADDR, VLLM_PORT)?;
-
-    // Send the request.
     sock.send_all(&request)?;
 
-    // Receive the full response.
     let mut raw_response = KVVec::new();
     sock.recv_all(&mut raw_response, MAX_RESPONSE_SIZE)?;
-
-    // sock is dropped here, releasing the connection.
     drop(sock);
 
-    // Parse HTTP status.
     let status = parse_http_status(&raw_response);
     if status != 200 {
         pr_warn!("hackbot: vLLM returned HTTP {}\n", status);
         if status == 0 {
             return Err(EIO);
         }
-        // For non-200 responses, try to return the body as the error message.
         let body = find_http_body(&raw_response);
         let mut result = KVVec::new();
         let _ = result.extend_from_slice(b"[HTTP ", GFP_KERNEL);
@@ -795,10 +1236,8 @@ fn vllm_complete(prompt: &[u8]) -> Result<KVVec<u8>> {
         return Ok(result);
     }
 
-    // Extract the body from the HTTP response.
     let body = find_http_body(&raw_response);
 
-    // Extract the "text" field from the JSON response.
     match extract_text_from_json(body) {
         Some(escaped_text) => {
             let mut result = KVVec::new();
@@ -807,13 +1246,156 @@ fn vllm_complete(prompt: &[u8]) -> Result<KVVec<u8>> {
         }
         None => {
             pr_warn!("hackbot: could not parse vLLM JSON response\n");
-            // Return the raw body as fallback.
             let mut result = KVVec::new();
             let _ = result.extend_from_slice(b"[hackbot] Raw response: ", GFP_KERNEL);
             let _ = result.extend_from_slice(body, GFP_KERNEL);
             Ok(result)
         }
     }
+}
+
+/// OODA agent loop: multi-turn conversation with kernel tool calls.
+///
+/// Builds the initial conversation (system prompt + tools description +
+/// live kernel context + user prompt), then loops:
+///   1. Send conversation to vLLM
+///   2. Parse response for `<tool>name</tool>` tags
+///   3. If tool call: execute tool, append result to conversation, continue
+///   4. If final answer (no tool call): return the response
+///   5. Stop after MAX_AGENT_ITERATIONS or if conversation exceeds size limit
+fn agent_loop(prompt: &[u8]) -> Result<KVVec<u8>> {
+    // Discover the served model name from vLLM (one extra GET per prompt).
+    let model_name = discover_model_name()?;
+
+    // Gather live kernel state.
+    let kernel_ctx = gather_kernel_context();
+
+    // Build the system message: identity → kernel context → tool description.
+    // Tools placed LAST for attention salience in small models.
+    let mut system_content = KVVec::new();
+    let _ = system_content.extend_from_slice(SYSTEM_IDENTITY, GFP_KERNEL);
+    let _ = system_content.extend_from_slice(&kernel_ctx, GFP_KERNEL);
+    let _ = system_content.extend_from_slice(TOOL_DESCRIPTION, GFP_KERNEL);
+
+    // Build messages: system + user prompt only.
+    // No few-shot conversation messages — the format example is inside the
+    // system prompt to avoid the model confusing example data with real data.
+    let mut messages = KVVec::new();
+    append_message_to_json(&mut messages, b"system", &system_content);
+    append_message_to_json(&mut messages, b"user", prompt);
+
+    let mut final_answer = KVVec::new();
+    let mut got_final_answer = false;
+
+    for iteration in 0..MAX_AGENT_ITERATIONS {
+        pr_info!(
+            "hackbot: agent iteration {}/{}\n",
+            iteration + 1,
+            MAX_AGENT_ITERATIONS,
+        );
+
+        // Safety check: don't let the messages array grow unbounded.
+        if messages.len() > MAX_CONVERSATION_SIZE {
+            pr_warn!("hackbot: conversation exceeded {} bytes, stopping\n", MAX_CONVERSATION_SIZE);
+            let _ = final_answer.extend_from_slice(
+                b"\n[hackbot] Agent stopped: conversation too large.\n",
+                GFP_KERNEL,
+            );
+            break;
+        }
+
+        // Call vLLM with the current messages.
+        let response = match vllm_call(&model_name, &messages) {
+            Ok(r) => r,
+            Err(e) => {
+                pr_err!("hackbot: vLLM call failed at iteration {}: {}\n", iteration + 1, e.to_errno());
+                if !final_answer.is_empty() {
+                    let _ = final_answer.extend_from_slice(
+                        b"\n[hackbot] vLLM error during agent loop.\n",
+                        GFP_KERNEL,
+                    );
+                    break;
+                }
+                return Err(e);
+            }
+        };
+
+        // Parse the response for tool calls.
+        match parse_tool_call(&response) {
+            ToolCallResult::FinalAnswer(text) => {
+                pr_info!("hackbot: final answer at iteration {}\n", iteration + 1);
+                let _ = final_answer.extend_from_slice(text, GFP_KERNEL);
+                got_final_answer = true;
+                break;
+            }
+            ToolCallResult::ToolCall { name, prefix } => {
+                pr_info!(
+                    "hackbot: tool call '{}' at iteration {}\n",
+                    core::str::from_utf8(name).unwrap_or("?"),
+                    iteration + 1,
+                );
+
+                // Last iteration: force output instead of looping forever.
+                // Execute the tool and return raw output — better than empty response.
+                if iteration == MAX_AGENT_ITERATIONS - 1 {
+                    pr_info!("hackbot: last iteration, forcing final answer with raw tool output\n");
+                    let tool_output = execute_tool(name);
+                    final_answer.truncate(0);
+                    if !prefix.is_empty() {
+                        let _ = final_answer.extend_from_slice(prefix, GFP_KERNEL);
+                        let _ = final_answer.extend_from_slice(b"\n\n", GFP_KERNEL);
+                    }
+                    let _ = final_answer.extend_from_slice(&tool_output, GFP_KERNEL);
+                    got_final_answer = true;
+                    break;
+                }
+
+                // Execute the tool.
+                let tool_output = execute_tool(name);
+
+                // Build the assistant's response (prefix + tool call tag).
+                let mut assistant_content = KVVec::new();
+                let _ = assistant_content.extend_from_slice(prefix, GFP_KERNEL);
+                let _ = assistant_content.extend_from_slice(b"<tool>", GFP_KERNEL);
+                let _ = assistant_content.extend_from_slice(name, GFP_KERNEL);
+                let _ = assistant_content.extend_from_slice(b"</tool>", GFP_KERNEL);
+
+                // Build tool result as a user message.
+                // Permissive prompt — don't restrict the model's action space.
+                let mut tool_result = KVVec::new();
+                let _ = tool_result.extend_from_slice(b"[Tool: ", GFP_KERNEL);
+                let _ = tool_result.extend_from_slice(name, GFP_KERNEL);
+                let _ = tool_result.extend_from_slice(b"]\n", GFP_KERNEL);
+                let _ = tool_result.extend_from_slice(&tool_output, GFP_KERNEL);
+                let _ = tool_result.extend_from_slice(
+                    b"[End Tool]\nThe tool output is above. \
+                      Now analyze this data and answer the user's question.",
+                    GFP_KERNEL,
+                );
+
+                append_message_to_json(&mut messages, b"assistant", &assistant_content);
+                append_message_to_json(&mut messages, b"user", &tool_result);
+
+                // Accumulate the prefix as partial answer.
+                let _ = final_answer.extend_from_slice(prefix, GFP_KERNEL);
+            }
+        }
+    }
+
+    // If we exhausted iterations without a clean final answer, append a note.
+    if !got_final_answer && final_answer.is_empty() {
+        let _ = final_answer.extend_from_slice(
+            b"[hackbot] Agent completed maximum iterations without a final answer.\n",
+            GFP_KERNEL,
+        );
+    } else if !got_final_answer {
+        let _ = final_answer.extend_from_slice(
+            b"\n[hackbot] Agent stopped after maximum iterations.\n",
+            GFP_KERNEL,
+        );
+    }
+
+    Ok(final_answer)
 }
 
 // ---------------------------------------------------------------------------

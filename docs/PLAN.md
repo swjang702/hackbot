@@ -1,7 +1,7 @@
 # hackbot Implementation Plan
 
 **Date**: 2026-03-02 (updated 2026-03-20)
-**Status**: Phase 1 complete, in-kernel LLM through Step 2b (kernel-aware inference)
+**Status**: Phase 1 complete, in-kernel LLM through Step 2c (OODA agent loop with kernel tools)
 **Guiding Principle**: Visualization-first MVP, Rust backend for Verus alignment
 
 ---
@@ -711,7 +711,7 @@ The in-kernel LLM has two orthogonal design dimensions:
                         │  but can't look       │  kernel context
                         │  around               │  but static
                         │                       │
- Dynamic                │  THE DREAM:           │  Step 2c (NEXT):
+ Dynamic                │  THE DREAM:           │  Step 2c (DONE):
  (OODA + tools)         │  autonomous agent,    │  smart + can
                         │  instant + capable    │  investigate, but
                         │                       │  100ms+ per step
@@ -726,19 +726,21 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 | **1** | Kernel module skeleton: `/dev/hackbot` + prompt/response | Infrastructure | **DONE** |
 | **2a** | Kernel socket → vLLM (System 2 brain) | B | **DONE** |
 | **2b** | Kernel context injection (live system state in prompt) | B | **DONE** |
-| **2c** | Dynamic agent loop + kernel tools (OODA) | B | **NEXT** |
-| **3** | In-kernel INT8 inference engine (System 1 reflex) | A | Research |
+| **2c** | Dynamic agent loop + kernel tools (OODA) | B | **DONE** |
+| **3** | In-kernel INT8 inference engine (System 1 reflex) | A | **NEXT** |
 | **4** | Hybrid System 1/2 merge | D | After 2c + 3 |
 | **5** | Action capabilities with Verus-verified safety | All | Research |
 | **6** | 3D game rendering of agent behavior | Frontend | After 4 |
 
-**Step 2c details** — the OODA agent loop:
-- Kernel implements observation tools (`ps`, `dmesg`, `mem`, `proc`, `mods`)
-- LLM generates `<tool>name args</tool>` tags to request kernel data
-- Agent loop in `vllm_complete`: prompt → vLLM → parse → if tool call, execute + re-prompt
-- Bounded iterations (max 5) + total timeout to prevent runaway
-- Read-only (Tier 0) tools first — no action capability yet
-- Tool interface is model-agnostic: works with both System 1 (INT8) and System 2 (vLLM)
+**Step 2c details** — the OODA agent loop (DONE):
+- Three kernel observation tools: `ps` (task list walk), `mem` (si_meminfo), `loadavg` (avenrun[])
+- LLM generates `<tool>name</tool>` tags to request kernel data
+- Agent loop in `agent_loop()`: prompt → vLLM → parse → if tool call, execute + re-prompt
+- Bounded iterations (max 5) + conversation size limit (48 KB)
+- Read-only (Tier 0) tools — no action capability
+- vLLM stop sequence `["</tool>"]` ensures clean tool call boundaries
+- Graceful degradation: base models (OPT-125M) work like Step 2b (no tool calls detected)
+- **Prerequisite for tool use**: instruction-following model (e.g., Qwen/Qwen2.5-7B-Instruct)
 
 **Step 3 details** — in-kernel INT8 (System 1):
 - Tiny model (~1-33M params) in `vmalloc` kernel memory
