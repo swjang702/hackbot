@@ -728,6 +728,7 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 | **2b** | Kernel context injection (live system state in prompt) | B | **DONE** |
 | **2c** | Dynamic agent loop + kernel tools (OODA) | B | **DONE** |
 | **3** | In-kernel INT8 inference engine (System 1 reflex) | A | **NEXT** |
+| **3a** | Add and connect the mcp server 'sequential-thinking' | B |  |
 | **4** | Hybrid System 1/2 merge | D | After 2c + 3 |
 | **5** | Action capabilities with Verus-verified safety | All | Research |
 | **6** | 3D game rendering of agent behavior | Frontend | After 4 |

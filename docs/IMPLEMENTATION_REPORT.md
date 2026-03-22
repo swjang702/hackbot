@@ -533,46 +533,74 @@ Model weights (135MB INT8) live in DRAM — memory bandwidth (~25 GB/s) is the r
 
 ### Implementation Substeps
 
-**Step 3f: Model Export Tool** (Python, userspace)
-- Convert SmolLM2-135M-Instruct from HuggingFace safetensors to hackbot binary format
-- INT8 per-group quantization (group_size=32, matching runq.c scheme)
-- Include BPE tokenizer vocab (49K entries) in the binary
-- Output: `/lib/firmware/hackbot-model.bin` (~135MB)
+**Step 3f: Model Export Tool** (Python, userspace) — **COMPLETE** (2026-03-22)
+- `tools/export_hackbot.py`: Converts HuggingFace LlamaForCausalLM to hackbot binary v1
+- INT8 per-group quantization (group_size=64) with Q16.16 fixed-point scales
+- BPE tokenizer with merge scores (48,900 merges) embedded in binary
+- Binary format v1: HEADER (56 bytes) → TOKENIZER (664KB) → WEIGHTS (143MB)
+- Tested: SmolLM2-135M-Instruct → 143,689,554 bytes (137 MB)
 
-**Step 3a: Weight Loading** (~200-300 lines Rust)
-- `ModelConfig` struct matching SmolLM2 architecture
-- `Firmware::request(c"hackbot-model.bin", &dev)` — kernel firmware API (exists in Linux 6.19.8 Rust bindings)
-- Parse header, allocate weight buffers (`KVVec<i8>` for INT8, `KVVec<i32>` for fixed-point scales)
-- Per-layer weight slices: rms_att, wq/wk/wv/wo (GQA dims), rms_ffn, gate/up/down projections
-- Embedding table: 49152 x 576 (with embedding tying for output logits)
+**Step 3a: Weight Loading** — **COMPLETE** (2026-03-22)
+- `ModelConfig`, `Q8Ref`, `LayerRef`, `ModelSlot` data structures
+- `parse_model_header()`: validates magic (HKBT), version, config constraints
+- `parse_and_store_model()`: walks binary, builds tokenizer index, computes all weight offsets
+- `load_model_if_needed()`: loads firmware via `Firmware::request_nowarn()` on first device open
+- Zero-copy weight access: weights stay in the kvmalloc'd firmware data copy (~137MB)
+- Tokenizer index: kvmalloc'd `[u32; vocab_size]` for O(1) token entry lookup
+- `free_model_resources()`: cleanup on module unload via `kvfree()`
 
-**Step 3b: Integer Math Primitives** (~300-400 lines Rust)
-- `matmul_q8()`: INT8 x INT8 -> INT32 accumulation, fixed-point rescaling. Scalar loops, no SIMD.
-- `rmsnorm_q()`: Integer sum-of-squares -> Newton's method integer sqrt -> divide
-- `softmax_q()`: Fixed-point exp via 256-entry LUT, normalize
-- `silu_q()`: x * sigmoid_approx(x), where sigmoid(x) ~ x / (1 + |x|)
-- `rope_q()`: Precomputed fixed-point sin/cos table (allocated at module init)
-- All operations in Q16.16 or Q8.24 fixed-point — zero floating point
+**Step 3b: Integer Math Primitives** — **COMPLETE** (2026-03-22)
+- `matmul_q8()`: INT8 weights × Q16.16 activations → Q16.16 output. Per-group scale application. i64 accumulation prevents overflow for practical activation ranges.
+- `rmsnorm_q16()`: Sum-of-squares (u64) → `isqrt_u64()` (Newton's method) → reciprocal → normalize. Epsilon in Q32.32 format.
+- `softmax_q16()`: Max subtraction → `exp_q16_neg()` (table + 3rd-order Taylor, <0.2% error) → normalize. In-place.
+- `sigmoid_q16()` / `silu_q16()`: Reuses exp function. σ(x)=exp(x)/(1+exp(x)) for x<0, 1/(1+exp(-x)) for x≥0.
+- `rope_apply_q16()`: 256-entry sin LUT with linear interpolation. Precomputed frequency table for head_dim=64, θ=10000.
+- `elementwise_mul_q16()`, `vec_add_q16()`, `silu_vec_q16()`: Vector utilities for SwiGLU and residual connections.
+- All Q16.16 fixed-point. Zero FPU/SIMD. Verified against Python reference: exp <0.2% error, matmul <0.01% error, rmsnorm exact for uniform inputs.
 
-**Step 3c: Transformer Forward Pass** (~400-500 lines Rust)
-- `TransformerState`: KV cache (3 KV heads x seq_len x head_dim), activation buffers
-- `forward(token, pos) -> logits`: single-token Llama-3 forward pass with GQA
-- Grouped Query Attention: 9 Q heads share 3 KV heads (3:1 ratio)
-- FFN: SiLU-gated — `silu(gate_proj(x)) * up_proj(x) -> down_proj`
-- Residual connections, RMSNorm before attention and FFN
+**Step 3c: Transformer Forward Pass** — **COMPLETE** (2026-03-22)
+- `alloc_inference_state()`: Single 11.7 MB kvmalloc for KV cache (11.5 MB) + 10 activation buffers (215 KB). Zero-initialized.
+- `forward_token(slot, token_id, pos)`: Full single-token Llama forward pass in Q16.16:
+  1. Embedding lookup: dequantize one row of Q8 embed_tokens (INT8 × Q16.16 scale)
+  2. 30 transformer layers, each with:
+     - Pre-attention RMSNorm → QKV projection (matmul_q8)
+     - RoPE on Q (9 heads) and K (3 heads)
+     - KV cache store at position `pos`
+     - GQA attention: 9 query heads, 3 KV heads (3:1 ratio). Score = (Q·K) >> 19 (exact for head_dim=64). Softmax → weighted V sum.
+     - Output projection (wo) + residual
+     - Pre-FFN RMSNorm → SwiGLU FFN: silu(gate) ⊙ up → down projection + residual
+  3. Final RMSNorm → logits via tied embedding matmul (49152 × 576)
+- `reset_kv_cache()`: Zero KV cache between conversations
+- `argmax_q16()`: Greedy decoding (find max logit)
+- KV cache layout: `[layer][k/v][kv_head][position][head_dim]` with precomputed strides
+- Buffer aliasing safety: all activation buffers at non-overlapping offsets, KV cache accessed via raw pointers
+- Memory: 137 MB weights + 11.7 MB inference state = ~149 MB total
 
-**Step 3d: Tokenizer + Text Generation** (~200-300 lines Rust)
-- BPE tokenizer: load 49K vocab + merge scores from firmware file
-- `encode()`: text -> token IDs (byte-pair merge loop)
-- `decode()`: token ID -> text piece
-- `generate()`: prompt -> tokenize -> forward x N -> argmax -> detokenize
-- Stop on EOS token or max_tokens limit
+**Step 3d: BPE Tokenizer + Text Generation** — **COMPLETE** (2026-03-22, revised 2026-03-22)
+- **Critical fix: GPT-2 BPE, not SentencePiece.** SmolLM2-135M-Instruct uses GPT-2's bytes_to_unicode encoding, where 68 of 256 byte values are mapped to non-identity Unicode codepoints (e.g., space 0x20→Ġ U+0120, newline 0x0A→Ċ U+010A, control chars→U+0100+). The original SentencePiece implementation (space→▁ U+2581) was completely wrong and would have produced garbage tokenization.
+- **Token ID constants fixed**: SmolLM2 uses 0=`<|endoftext|>` (EOS), 1=`<|im_start|>` (BOS/chat start), 2=`<|im_end|>` (chat end). NOT SentencePiece convention (0=unk, 1=BOS, 2=EOS).
+- `GPT2_BYTE_TO_CODEPOINT[256]`: Compile-time lookup table mapping each raw byte to its GPT-2 Unicode codepoint. 188 bytes are identity (printable ASCII 33-126 + some high bytes), 68 are remapped to U+0100-U+0143.
+- `GPT2_CODEPOINT_TO_BYTE[324]`: Const-computed inverse table for decoding GPT-2 token bytes back to raw bytes.
+- `preprocess_gpt2()`: Replaces `preprocess_sentencepiece()`. Converts raw input bytes to GPT-2 Unicode codepoints encoded as UTF-8. Printable ASCII stays 1 byte; remapped bytes become 2-byte UTF-8 sequences.
+- `gpt2_decode_token()`: Converts GPT-2 encoded token bytes back to raw bytes for output. Parses UTF-8 codepoints and maps through `GPT2_CODEPOINT_TO_BYTE`.
+- `build_sorted_vocab()`: Fixed `byte_to_token[256]` construction — now computes GPT-2 codepoint for each byte, encodes as UTF-8, and searches sorted vocab. Handles both 1-byte and 2-byte UTF-8 token representations.
+- `encode_bpe()`: Fixed initial byte decomposition — handles mixed 1-byte (ASCII) and 2-byte (GPT-2 remapped) UTF-8 characters from preprocessed input. 1-byte: direct `byte_to_token` lookup. 2-byte: binary search over sorted vocab.
+- `generate_from_tokens()`: Factored from `generate()` — takes pre-tokenized prompt (token IDs), runs prefill + autoregressive decode, outputs decoded bytes via `gpt2_decode_token()`. Stops on TOKEN_ENDOFTEXT or TOKEN_IM_END.
+- Sorted vocabulary index, heapsort, `decode_token_bytes()`, `get_token_score()`, `find_token_by_bytes()`, `get_next_token()` — unchanged from original implementation.
+- Heapsort: in-place O(V log V), no external sort. Binary search: O(log V) per token lookup.
 
-**Step 3e: Agent Integration** (~100-150 lines Rust)
-- `local_inference(prompt) -> Result<KVVec<u8>>` replacing `vllm_call()`
-- Module parameter: `inference_mode` (0=vLLM/System 2, 1=local/System 1)
-- Same `agent_loop()`, same tool parsing, same OODA loop
-- Graceful fallback: if model firmware not found, use vLLM
+**Step 3e: Agent Integration** — **COMPLETE** (2026-03-22)
+- **Auto-detect inference backend**: `INFERENCE_MODE` constant (0=auto, 1=local-only, 2=vllm-only). Auto mode: tries local inference if model loaded, falls back to vLLM on failure or empty output.
+- `agent_loop()`: New dispatcher that checks `INFERENCE_MODE` and `MODEL.loaded` to route to `agent_loop_local()` or `agent_loop_vllm()` (renamed from old `agent_loop()`).
+- `agent_loop_local()`: Local OODA loop with ChatML format. Builds conversation as token IDs directly (not text):
+  - `append_chat_tokens(slot, tokens, pos, role, content)`: Assembles `<|im_start|>{role}\n{content}<|im_end|>\n` as token IDs. Special tokens (IDs 0-2) inserted directly since BPE won't merge them (score=0).
+  - `begin_assistant_turn(slot, tokens, pos)`: Assembles `<|im_start|>assistant\n` prefix for generation.
+  - Each OODA iteration: encode full conversation → `generate_from_tokens()` → parse for `<tool>` tags → execute tool → append tool output as user message → re-encode full conversation (O(n²) re-encoding, acceptable for 256-token context).
+- `LOCAL_SYSTEM_PROMPT`: Compact system prompt (~25 tokens) with tool descriptions.
+- `LOCAL_MAX_ITERATIONS`: 3 (vs 10 for vLLM) — tighter budget for 135M model.
+- `LOCAL_MAX_TOOL_OUTPUT`: 512 bytes (vs 8KB for vLLM) — prevents context overflow.
+- `process_prompt()`: Error message updated from "vLLM error" to "Inference error" with ENODEV hint ("Model not loaded and vLLM unreachable").
+- ~300 lines of new code. Builds successfully with 4 warnings (unused struct fields for future phases).
 
 ### Build Order
 
