@@ -733,23 +733,29 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 | **6** | 3D game rendering of agent behavior | Frontend | After 4 |
 
 **Step 2c details** — the OODA agent loop (DONE):
-- Three kernel observation tools: `ps` (task list walk), `mem` (si_meminfo), `loadavg` (avenrun[])
+- Three kernel observation tools: `ps` (two-pass walk, user-space first), `mem` (si_meminfo), `loadavg` (avenrun[])
 - LLM generates `<tool>name</tool>` tags to request kernel data
 - Agent loop in `agent_loop()`: prompt → vLLM → parse → if tool call, execute + re-prompt
-- Bounded iterations (max 5) + conversation size limit (48 KB)
+- Bounded iterations (max 10) + conversation size limit (96 KB)
 - Read-only (Tier 0) tools — no action capability
 - vLLM stop sequence `["</tool>"]` ensures clean tool call boundaries
 - Graceful degradation: base models (OPT-125M) work like Step 2b (no tool calls detected)
-- **Prerequisite for tool use**: instruction-following model (e.g., Qwen/Qwen2.5-7B-Instruct)
+- **Tested with**: Qwen/Qwen2.5-7B-Instruct-AWQ on keti GPU server via Tailscale
 
-**Step 3 details** — in-kernel INT8 (System 1):
-- Tiny model (~1-33M params) in `vmalloc` kernel memory
-- CPU inference via `kernel_fpu_begin/end` + AVX/SSE
-- Uses the SAME tool interface as Step 2c
-- Always-on anomaly detection, no network dependency
-- This is the substrate swap: remote GPU → local CPU, tools stay the same
+**Step 3 details** — in-kernel INT8 inference (System 1):
+- **Model**: SmolLM2-135M-Instruct (Llama-3 architecture, instruction-tuned, GQA)
+  - 30 layers, dim=576, 9 Q heads / 3 KV heads, vocab=49152
+  - INT8 quantized: ~135MB in `/lib/firmware/hackbot-model.bin`
+- **Inference**: Pure scalar integer arithmetic — no FPU, no kernel_fpu_begin/end
+  - INT8 matmul with INT32 accumulation
+  - Fixed-point (Q16.16) for softmax/RMSNorm/SiLU via lookup tables
+  - Estimated ~10-20 tok/s on Ryzen 5 PRO 4650G (memory-bandwidth limited)
+- **Why SmolLM2 over TinyStories**: Already instruction-tuned (can follow tool-calling format), same Llama architecture, no throwaway work on different model format/tokenizer
+- **Substeps**: 3f (Python model exporter) → 3a (firmware weight loading) → 3b (integer math primitives) → 3c (Llama-3 forward pass with GQA) → 3d (BPE tokenizer) → 3e (wire into agent_loop)
+- Uses the SAME tool interface as Step 2c — substrate swap only
+- Optional Step 3.5: AVX2 SIMD kernels (C FFI + kernel_fpu_begin/end) for ~3-5x speedup
 
-**Why OODA before INT8**: The tool interface (Step 2c) is foundational — it defines what the agent CAN DO regardless of where inference runs. INT8 (Step 3) is a performance optimization of where inference runs. We validate the tool architecture with remote vLLM first (easier debugging, smarter model), then swap in the local INT8 engine later.
+**Why OODA before INT8**: The tool interface (Step 2c) is foundational — it defines what the agent CAN DO regardless of where inference runs. INT8 (Step 3) is a performance optimization of where inference runs. We validated the tool architecture with remote vLLM first (easier debugging, smarter model), then swap in the local INT8 engine.
 
 ### Action Safety: Tiered Capability System
 
@@ -871,8 +877,9 @@ The Kernel World (3D game environment)
 |-------|--------|---------|--------|-----------|-----|
 | Custom tiny | 1M | ~2MB | 1 (in-kernel) | 50-100 | Pattern matching, anomaly flagging |
 | TinyStories | 33M | ~20MB | 1 (in-kernel) | 5-10 | Simple observation summaries |
+| **SmolLM2-135M-Instruct** | **135M** | **~135MB** | **1 (in-kernel)** | **10-20** | **Instruction-following, tool calling (TARGET)** |
 | GPT-2 small | 124M | ~70MB | 1 (in-kernel) | 1-3 | Basic reasoning (ambitious) |
-| phi4-mini | 3.8B | ~4.5GB | 2 (vLLM/GPU) | 20-50 | Full reasoning, analysis, planning |
+| Qwen2.5-7B-Instruct-AWQ | 7B | ~4GB | 2 (vLLM/GPU) | 20-50 | Full reasoning, analysis, planning |
 | Llama 3 | 8B | ~5GB | 2 (vLLM/GPU) | 10-30 | State-of-art reasoning |
 
 ---

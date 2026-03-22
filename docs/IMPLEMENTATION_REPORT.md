@@ -381,7 +381,7 @@ Three tools available to the LLM, all using ring 0 kernel APIs:
 - vLLM applies the correct chat template automatically (ChatML for Qwen, etc.)
 - Messages built incrementally via `append_message_to_json()` helper
 - Loops: vLLM call → parse → tool dispatch → append assistant+user messages → re-prompt
-- Bounded by `MAX_AGENT_ITERATIONS` (10) and `MAX_CONVERSATION_SIZE` (48 KB)
+- Bounded by `MAX_AGENT_ITERATIONS` (10) and `MAX_CONVERSATION_SIZE` (96 KB)
 - Request includes `temperature: 0.6` and `repetition_penalty: 1.1` to reduce degenerate outputs
 - Graceful degradation: if the model doesn't generate tool calls, returns the first response as final answer
 
@@ -423,7 +423,7 @@ Three tools available to the LLM, all using ring 0 kernel APIs:
 - Uses `/v1/chat/completions` endpoint (not `/v1/completions`) — vLLM applies chat template automatically
 - `build_vllm_request()` takes pre-built JSON messages array
 - `append_message_to_json()` incrementally builds the array (truncate `]`, append `,{...}]`)
-- Request body: `{"model":"<auto-discovered>","messages":[...],"max_tokens":512,"temperature":0.6,"repetition_penalty":1.1,"stop":["</tool>"]}`
+- Request body: `{"model":"<auto-discovered>","messages":[...],"max_tokens":4096,"temperature":0.7,"repetition_penalty":1.1,"stop":["</tool>"]}`
 - Each iteration makes a new TCP connection (Connection: close), keeping things simple
 - `extract_text_from_json()` looks for `"content":"` pattern (chat completions response format)
 
@@ -433,7 +433,7 @@ Three tools available to the LLM, all using ring 0 kernel APIs:
 - **Stop sequence `</tool>`**: Prevents the LLM from generating fake tool output after a tool call. The model generates `<tool>ps`, vLLM stops, we execute the real tool and inject its output.
 - **Single tool per iteration**: Parsing only the first `<tool>` tag keeps the loop simple and predictable. Multiple tools per turn adds complexity with minimal benefit.
 - **Chat completions over raw completions**: Instruct/chat models (Qwen, Llama, etc.) require proper role tokens to engage instruction-following behavior. Raw `/v1/completions` leads to degenerate text completion (hallucinated conversations, repetition loops). `/v1/chat/completions` applies the chat template automatically.
-- **Structured messages**: Each iteration appends assistant + user messages to a JSON array. Bounded by MAX_CONVERSATION_SIZE (48 KB). The assistant message includes reasoning prefix to maintain chain-of-thought.
+- **Structured messages**: Each iteration appends assistant + user messages to a JSON array. Bounded by MAX_CONVERSATION_SIZE (96 KB). The assistant message includes reasoning prefix to maintain chain-of-thought.
 - **Graceful model degradation**: If the model never generates `<tool>` tags (e.g., OPT-125M base model), the loop exits on iteration 1 with a FinalAnswer — functionally identical to Step 2b.
 - **Tool-call loop prevention**: Force final answer on last iteration — execute the tool and return raw output rather than empty "max iterations" message. Aggressive nudge prompts ("Do NOT call more tools") were tested and **removed** — they restrict the model's action space and produce worse results (placeholder output from 7B-AWQ). Permissive prompts work better: "Now analyze this data and answer the user's question."
 - **Model auto-discovery**: `discover_model_name()` queries vLLM's `/v1/models` endpoint to get the actual served model name, so the module works with any model without hardcoding.
@@ -468,20 +468,137 @@ vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --port 8000
 
 ---
 
-## Next Steps
+## Step 3: In-Kernel INT8 Inference Engine (System 1)
 
-### Step 3 — In-Kernel INT8 Inference (System 1)
+**Status**: Planning complete, implementation not started
+**Date**: 2026-03-22
 
-- Tiny model (~1-33M params) in `vmalloc` kernel memory
-- CPU inference via `kernel_fpu_begin/end` + AVX
-- Uses the SAME tool interface as Step 2c
-- Always-on anomaly detection, no network dependency
+### Overview
+
+Step 3 swaps the inference substrate from remote vLLM (System 2) to a local CPU-only INT8 engine running inside the kernel module. The OODA tool interface from Step 2c is unchanged — we're replacing WHERE inference happens, not WHAT the agent can do.
+
+**Target model**: [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) — a 135M-parameter Llama-3 variant that is already instruction-tuned.
+
+### Why SmolLM2-135M-Instruct (Not TinyStories)
+
+| Factor | TinyStories-15M | SmolLM2-135M-Instruct |
+|--------|----------------|----------------------|
+| Can follow instructions | No | **Yes** |
+| Can call tools | No (needs fine-tuning) | **Likely yes** |
+| Testable use case | No | **Yes, from day one** |
+| Binary format | llama2.c custom | HuggingFace safetensors |
+| Tokenizer | GPT-Neo 10K | BPE 49K |
+| Attention | MHA | **GQA** (3× smaller KV cache) |
+
+TinyStories was considered as a simpler first step, but rejected because:
+1. Different model format, tokenizer, and attention type — all throwaway work
+2. Cannot test the actual use case (instruction following, tool calling)
+3. Scalar integer is fast enough for 135M on the target hardware (~10-20 tok/s)
+
+### Architecture
+
+```
+SmolLM2-135M-Instruct (Llama-3 variant):
+  hidden_size:       576
+  intermediate_size: 1536
+  num_layers:        30
+  num_attention_heads:    9  (Q heads)
+  num_key_value_heads:    3  (KV heads, GQA 3:1)
+  vocab_size:        49152
+  max_position_embeddings: 2048
+  activation:        SiLU
+  normalization:     RMSNorm
+  positional encoding: RoPE
+```
+
+### Hardware Target
+
+```
+AMD Ryzen 5 PRO 4650G (Zen 2), 6c/12t, 4.2 GHz
+  L2: 512KB/core, L3: 8MB shared
+  SIMD: SSE4.2, AVX, AVX2 (no AVX-512)
+  RAM: 14GB DDR4 (~25 GB/s bandwidth)
+```
+
+### Performance Estimates
+
+| Approach | tok/s | FPU needed? | Complexity |
+|----------|-------|-------------|------------|
+| **Scalar integer (Step 3)** | ~10-20 | No | Low |
+| AVX2 integer SIMD (Step 3.5) | ~50-60 | Yes (`kernel_fpu_begin/end`) | Medium (C FFI) |
+
+Scalar is fast enough for a research prototype. AVX2 is an optional optimization.
+
+Model weights (135MB INT8) live in DRAM — memory bandwidth (~25 GB/s) is the real bottleneck, not compute. No architecture change fixes this.
+
+### Implementation Substeps
+
+**Step 3f: Model Export Tool** (Python, userspace)
+- Convert SmolLM2-135M-Instruct from HuggingFace safetensors to hackbot binary format
+- INT8 per-group quantization (group_size=32, matching runq.c scheme)
+- Include BPE tokenizer vocab (49K entries) in the binary
+- Output: `/lib/firmware/hackbot-model.bin` (~135MB)
+
+**Step 3a: Weight Loading** (~200-300 lines Rust)
+- `ModelConfig` struct matching SmolLM2 architecture
+- `Firmware::request(c"hackbot-model.bin", &dev)` — kernel firmware API (exists in Linux 6.19.8 Rust bindings)
+- Parse header, allocate weight buffers (`KVVec<i8>` for INT8, `KVVec<i32>` for fixed-point scales)
+- Per-layer weight slices: rms_att, wq/wk/wv/wo (GQA dims), rms_ffn, gate/up/down projections
+- Embedding table: 49152 x 576 (with embedding tying for output logits)
+
+**Step 3b: Integer Math Primitives** (~300-400 lines Rust)
+- `matmul_q8()`: INT8 x INT8 -> INT32 accumulation, fixed-point rescaling. Scalar loops, no SIMD.
+- `rmsnorm_q()`: Integer sum-of-squares -> Newton's method integer sqrt -> divide
+- `softmax_q()`: Fixed-point exp via 256-entry LUT, normalize
+- `silu_q()`: x * sigmoid_approx(x), where sigmoid(x) ~ x / (1 + |x|)
+- `rope_q()`: Precomputed fixed-point sin/cos table (allocated at module init)
+- All operations in Q16.16 or Q8.24 fixed-point — zero floating point
+
+**Step 3c: Transformer Forward Pass** (~400-500 lines Rust)
+- `TransformerState`: KV cache (3 KV heads x seq_len x head_dim), activation buffers
+- `forward(token, pos) -> logits`: single-token Llama-3 forward pass with GQA
+- Grouped Query Attention: 9 Q heads share 3 KV heads (3:1 ratio)
+- FFN: SiLU-gated — `silu(gate_proj(x)) * up_proj(x) -> down_proj`
+- Residual connections, RMSNorm before attention and FFN
+
+**Step 3d: Tokenizer + Text Generation** (~200-300 lines Rust)
+- BPE tokenizer: load 49K vocab + merge scores from firmware file
+- `encode()`: text -> token IDs (byte-pair merge loop)
+- `decode()`: token ID -> text piece
+- `generate()`: prompt -> tokenize -> forward x N -> argmax -> detokenize
+- Stop on EOS token or max_tokens limit
+
+**Step 3e: Agent Integration** (~100-150 lines Rust)
+- `local_inference(prompt) -> Result<KVVec<u8>>` replacing `vllm_call()`
+- Module parameter: `inference_mode` (0=vLLM/System 2, 1=local/System 1)
+- Same `agent_loop()`, same tool parsing, same OODA loop
+- Graceful fallback: if model firmware not found, use vLLM
+
+### Build Order
+
+```
+3f (export model) -> 3a (load weights) -> 3b (math ops) -> 3c (forward pass) -> 3d (tokenizer) -> 3e (agent integration)
+```
+
+### Reference Implementations
+
+- [llama2.c](https://github.com/karpathy/llm2.c) — `run.c` (float32) and `runq.c` (INT8) by Karpathy. Architecture blueprint.
+- [KLLM](https://github.com/randombk/kllm) — Proof that kernel-space LLM inference works (GPT-2 124M, no SIMD, 1min/token).
+- `linux-6.19.8/rust/kernel/firmware.rs` — Rust firmware loading API.
+
+### Key Design Decisions
+
+- **Scalar integer over AVX2**: Avoids kernel_fpu_begin/end complexity, mixed C/Rust build. Fast enough (~10-20 tok/s) for 135M on Zen 2. AVX2 deferred to Step 3.5.
+- **SmolLM2-135M over TinyStories**: Instruction-tuned model that can follow tool-calling format from day one. No throwaway work on a different model format.
+- **GQA from the start**: SmolLM2 uses Grouped Query Attention (9Q/3KV). Smaller KV cache, better for kernel memory. Implement this directly rather than MHA first.
+- **Fixed-point non-linearities**: exp/sqrt/sigmoid via integer lookup tables and polynomial approximations. Zero floating-point operations in the hot path.
+- **Firmware API for weights**: `kernel::firmware::Firmware` loads from `/lib/firmware/`. Standard kernel mechanism, handles module dependencies correctly.
 
 ### Architecture Context
 
 See `docs/PLAN.md` Appendix B for the System 1/2 hybrid architecture analysis. Key insight (2026-03-20): inference substrate (WHERE) and agent capability (WHAT) are orthogonal axes. Build OODA tools first (Step 2c), then swap inference backend (Step 3).
 
-**Safety**: Tiered capability system (Tier 0: observe → Tier 3: modify kernel). Steps 2c-3 are Tier 0 only (read-only observation). Action capabilities (Tier 1+) deferred to Step 5, requiring Verus verification.
+**Safety**: Tiered capability system (Tier 0: observe -> Tier 3: modify kernel). Steps 2c-3 are Tier 0 only (read-only observation). Action capabilities (Tier 1+) deferred to Step 5, requiring Verus verification.
 
 ## Research: GPU/NPU Compute from Kernel Space (Linux 6.19.8)
 

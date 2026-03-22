@@ -82,29 +82,34 @@ const MAX_AGENT_ITERATIONS: usize = 10;
 const MAX_PS_TASKS: usize = 512;
 /// Maximum size for a single tool output (8 KB).
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
-/// Maximum conversation size sent to vLLM (48 KB). Prevents unbounded prompt growth.
-const MAX_CONVERSATION_SIZE: usize = 48 * 1024;
+/// Maximum conversation size sent to vLLM (96 KB).
+/// Gives room for ~10 rounds of deep reasoning + tool output.
+/// Budget per round: ~4KB reasoning + ~8KB tool output = ~12KB.
+/// System prompt + kernel context ≈ 2KB. Leaves ~94KB for OODA iterations.
+const MAX_CONVERSATION_SIZE: usize = 96 * 1024;
 
-/// System prompt — the agent's identity. Concise for small models.
-const SYSTEM_IDENTITY: &[u8] = b"You are hackbot, an AI running inside the Linux kernel. \
-You have tools to observe live system state. ALWAYS use tools -- never guess or make up data.\n\n";
+/// System prompt — the agent's identity.
+/// Encourages free thinking and reasoning, not just tool dispatching.
+const SYSTEM_IDENTITY: &[u8] = b"You are hackbot, an autonomous AI agent living inside the Linux kernel (ring 0). \
+You exist as a kernel module with direct access to hardware and kernel data structures.\n\n\
+Think deeply. Reason carefully. Share your insights and analysis freely. \
+You are a thinking agent, not just a tool dispatcher.\n\n";
 
-/// Tool description -- structured with format example inside the system prompt.
-/// The example is instructional text, NOT conversation history, so the model
-/// won't confuse it with real data.
-const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- output the exact XML tag to call a tool:\n\
+/// Tool description — permissive guidance, not restrictive rules.
+/// The model decides when to use tools vs when to reason directly.
+const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- when you need live kernel data, output the exact XML tag:\n\
   <tool>ps</tool>      - list running processes (PID, PPID, state, command)\n\
   <tool>mem</tool>     - detailed memory statistics\n\
   <tool>loadavg</tool> - system load averages\n\n\
-FORMAT EXAMPLE:\n\
-  User: what is the system load?\n\
-  You respond with ONLY: <tool>loadavg</tool>\n\
-  You then receive the real tool output and summarize it for the user.\n\n\
-RULES:\n\
-- When asked about processes, memory, or load: ALWAYS call the relevant tool FIRST\n\
-- Respond with ONLY the <tool> tag -- no other text before it\n\
-- After receiving tool output, provide a clear summary to the user\n\
-- NEVER reference example data -- always call tools to get real, live data\n";
+HOW TO USE:\n\
+- To call a tool, include <tool>name</tool> in your response\n\
+- You will receive the real output, then can analyze and discuss it\n\
+- Use tools when the user asks about current system state\n\
+- For reasoning, analysis, or discussion -- think and respond directly\n\
+- You may reason before calling a tool\n\n\
+IMPORTANT: Never fabricate system data (PIDs, memory numbers, load values). \
+Use tools to get real data when needed. But feel free to reason, analyze, \
+and share your thoughts on any topic.\n";
 
 // Note: RESPONSE_PREFIX removed — chat completions API handles turn-taking
 // via the messages array structure (system/user/assistant roles).
@@ -992,7 +997,7 @@ fn build_vllm_request(model_name: &[u8], messages_json: &[u8]) -> Result<KVVec<u
     let _ = body.extend_from_slice(b"\",\"messages\":", GFP_KERNEL);
     let _ = body.extend_from_slice(messages_json, GFP_KERNEL);
     let _ = body.extend_from_slice(
-        b",\"max_tokens\":512,\"temperature\":0.6,\"repetition_penalty\":1.1,\"stop\":[\"</tool>\"]}",
+        b",\"max_tokens\":4096,\"temperature\":0.7,\"repetition_penalty\":1.1,\"stop\":[\"</tool>\"]}",
         GFP_KERNEL,
     );
 
@@ -1368,8 +1373,8 @@ fn agent_loop(prompt: &[u8]) -> Result<KVVec<u8>> {
                 let _ = tool_result.extend_from_slice(b"]\n", GFP_KERNEL);
                 let _ = tool_result.extend_from_slice(&tool_output, GFP_KERNEL);
                 let _ = tool_result.extend_from_slice(
-                    b"[End Tool]\nThe tool output is above. \
-                      Now analyze this data and answer the user's question.",
+                    b"[End Tool]\nAbove is live data from the kernel. \
+Analyze it thoughtfully and respond to the user.",
                     GFP_KERNEL,
                 );
 
