@@ -628,6 +628,124 @@ See `docs/PLAN.md` Appendix B for the System 1/2 hybrid architecture analysis. K
 
 **Safety**: Tiered capability system (Tier 0: observe -> Tier 3: modify kernel). Steps 2c-3 are Tier 0 only (read-only observation). Action capabilities (Tier 1+) deferred to Step 5, requiring Verus verification.
 
+## Step 3f: FP16/Float32 FPU Inference Path
+
+**Status**: Builds and links, output under investigation
+**Date**: 2026-03-26
+
+### Overview
+
+Step 3f addresses the Q16.16 fixed-point precision bottleneck discovered during Step 3 testing. Both INT8+Q16.16 (format v1) and FP16+Q16.16 produce identical degenerate output — the problem is not weight quantization but arithmetic precision. Q16.16 has only ~4.8 decimal digits of precision, and error accumulates catastrophically across SmolLM2's 30 transformer layers.
+
+The solution: float32 arithmetic in the kernel using the FPU, following the same approach as `aesni-intel` and other crypto modules that call `kernel_fpu_begin()`/`kernel_fpu_end()` to safely use SSE/AVX instructions.
+
+### Root Cause Analysis
+
+| Format | Weight precision | Arithmetic precision | Result |
+|--------|-----------------|---------------------|--------|
+| v1: INT8 weights | ~7 bits | Q16.16 (~4.8 digits) | Degenerate output |
+| v1 with FP16 weights | ~3.3 digits | Q16.16 (~4.8 digits) | **Same** degenerate output |
+| v2: FP16 weights | ~3.3 digits | float32 (~7.2 digits) | Under investigation |
+
+The key insight: both INT8 and FP16 weight variants produced identical garbage when using Q16.16 arithmetic for activations, softmax, RMSNorm, and RoPE. The bottleneck is in the intermediate computations (especially softmax and RMSNorm), not the weight storage format.
+
+### Architecture
+
+```
+hackbot_main.rs (Rust)                    hackbot_fpu.c (C, with FPU)
+  │                                          │
+  ├── load model (FP16 binary)              ├── hackbot_fpu_alloc()
+  ├── tokenizer (BPE, same as v1)           ├── hackbot_fpu_free()
+  ├── agent loop (same as v1)               ├── hackbot_fpu_reset()
+  │                                         ├── hackbot_fpu_forward()
+  └── forward_token() ──delegates──────────►│   kernel_fpu_begin()
+      get_next_token() ──delegates──────────►│   float32 matmul, rmsnorm,
+                                            │   softmax, rope, swiglu
+                                            │   kernel_fpu_end()
+                                            └── hackbot_fpu_get_next_token()
+```
+
+### Model Format v2
+
+Produced by `tools/export_hackbot_fp16.py`. Binary layout:
+
+```
+HEADER (56 bytes):
+  magic: "HKBT"
+  version: 2
+  dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len
+  weight_type: 0 (= FP16, stored in group_size field)
+  head_dim, kv_dim, rope_theta
+
+TOKENIZER (same as v1):
+  n_vocab, max_token_len, then per-token: [i32 score][u16 len][bytes]
+
+WEIGHTS (FP16 + float32):
+  embed_tokens: [vocab_size × dim] FP16
+  Per layer (×30):
+    rms_att_weight: [dim] float32
+    wq: [n_heads×head_dim × dim] FP16
+    wk: [n_kv_heads×head_dim × dim] FP16
+    wv: [n_kv_heads×head_dim × dim] FP16
+    wo: [dim × n_heads×head_dim] FP16
+    rms_ffn_weight: [dim] float32
+    gate: [hidden_dim × dim] FP16
+    up: [hidden_dim × dim] FP16
+    down: [dim × hidden_dim] FP16
+  rms_final_weight: [dim] float32
+```
+
+### Key Implementation Details
+
+**C FPU Helper** (`hackbot_fpu.c`):
+- `hackbot_fpu_alloc()`: Allocates float32 KV cache + activation buffers via `kvmalloc`
+- `hackbot_fpu_forward()`: Full single-token Llama forward pass in float32:
+  1. FP16→float32 embedding dequant
+  2. RMSNorm with float32 weights
+  3. QKV projection (FP16 matmul with float32 accumulation)
+  4. RoPE (sinf/cosf)
+  5. GQA attention with causal mask
+  6. SwiGLU FFN
+  7. Logits via tied embedding
+- `kernel_fpu_begin()`/`kernel_fpu_end()` bracket all FPU operations
+- Compiled with `-mhard-float -msse -msse2` (only for this file)
+
+**Kbuild** (`hackbot-kmod/Kbuild`):
+```makefile
+hackbot-y := hackbot_main.o hackbot_fpu.o
+CFLAGS_hackbot_fpu.o := -mhard-float -msse -msse2
+```
+
+**Rust FFI** (in `hackbot_main.rs`):
+```rust
+extern "C" {
+    fn hackbot_fpu_alloc(...) -> *mut c_void;
+    fn hackbot_fpu_free(state: *mut c_void);
+    fn hackbot_fpu_reset(state: *mut c_void);
+    fn hackbot_fpu_forward(state: *mut c_void, weights: *const c_void, ...) -> i32;
+    fn hackbot_fpu_get_next_token(state: *const c_void) -> i32;
+}
+```
+
+**Version dispatch**: `forward_token()`, `reset_kv_cache()`, `get_next_token()`, and `alloc_inference_state()` all check `slot.format_version` and delegate to the C FPU path for v2, or the Rust Q16.16 path for v1.
+
+### Files Changed/Added
+
+- `hackbot-kmod/hackbot_fpu.c` — New: float32 forward pass with kernel FPU (~800 lines)
+- `hackbot-kmod/hackbot_fpu.h` — New: FFI header for Rust↔C interface
+- `hackbot-kmod/hackbot_main.rs` — v2 format support, FPU FFI declarations, version dispatch
+- `hackbot-kmod/Kbuild` — Mixed C+Rust module, FPU compiler flags
+- `tools/export_hackbot_fp16.py` — New: FP16 model exporter (format v2)
+
+### Current Status
+
+The module compiles, links, and loads successfully. The v2 model is detected and parsed. However, the output is still degenerate — investigation needed:
+1. Verify v2 model binary is correct (Python reference comparison)
+2. Check FPU forward pass weight layout matches exporter
+3. Compare intermediate values (embedding, post-layer, logits) against Python reference
+
+---
+
 ## Research: GPU/NPU Compute from Kernel Space (Linux 6.19.8)
 
 **Date**: 2026-03-17

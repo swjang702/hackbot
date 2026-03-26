@@ -1,7 +1,7 @@
 # hackbot Implementation Plan
 
-**Date**: 2026-03-02 (updated 2026-03-20)
-**Status**: Phase 1 complete, in-kernel LLM through Step 2c (OODA agent loop with kernel tools)
+**Date**: 2026-03-02 (updated 2026-03-26)
+**Status**: Phase 1 complete, in-kernel LLM through Step 3f (FP16/float32 FPU inference path — builds, under debugging)
 **Guiding Principle**: Visualization-first MVP, Rust backend for Verus alignment
 
 ---
@@ -755,6 +755,12 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 - **Substeps**: 3f (Python model exporter) → 3a (firmware weight loading) → 3b (integer math primitives) → 3c (Llama-3 forward pass with GQA) → 3d (BPE tokenizer) → 3e (wire into agent_loop)
 - Uses the SAME tool interface as Step 2c — substrate swap only
 - Optional Step 3.5: AVX2 SIMD kernels (C FFI + kernel_fpu_begin/end) for ~3-5x speedup
+- **Step 3f: FP16/Float32 FPU inference path** (2026-03-26):
+  - **Root cause finding**: Q16.16 fixed-point has only ~4.8 decimal digits of precision. Error accumulates catastrophically across 30 transformer layers — both INT8+Q16.16 and FP16+Q16.16 produce identical degenerate output (the arithmetic precision bottleneck, not the weight quantization).
+  - **Solution**: kernel FPU with float32 arithmetic via C helper (`hackbot_fpu.c`), following the same approach as `aesni-intel` crypto modules (`kernel_fpu_begin()`/`kernel_fpu_end()`).
+  - **Model format v2**: FP16 weights (`weight_type=0`), float32 RMSNorm weights. New exporter: `tools/export_hackbot_fp16.py`.
+  - **New files**: `hackbot_fpu.c` (float32 forward pass in C), `hackbot_fpu.h` (FFI header). Kbuild: `-mhard-float -msse -msse2` for `hackbot_fpu.o`.
+  - **Status**: Compiles and links into `hackbot.ko`. Model loads. Output still degenerate — under investigation (likely weight layout or FPU forward pass bug).
 
 **Why OODA before INT8**: The tool interface (Step 2c) is foundational — it defines what the agent CAN DO regardless of where inference runs. INT8 (Step 3) is a performance optimization of where inference runs. We validated the tool architecture with remote vLLM first (easier debugging, smarter model), then swap in the local INT8 engine.
 
