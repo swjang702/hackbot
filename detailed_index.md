@@ -1,6 +1,6 @@
 # hackbot — Detailed File Index
 
-> Last updated: 2026-03-08
+> Last updated: 2026-03-27
 > Lists all public types, functions, and their signatures.
 
 ---
@@ -416,3 +416,455 @@ Vite dev server configuration. Port 5173. Proxies:
 ## `traces/format.md`
 
 Trace format specification documenting the JSON Lines schema, all 8 event types with payload examples, and notes on timestamp handling (nanosecond u64, string serialization for JS safety).
+
+---
+
+# hackbot-kmod — Kernel Module
+
+---
+
+## `hackbot-kmod/hackbot_main.rs`
+
+Root module file. Declares the hackbot kernel module and includes all submodules.
+
+### Module Declaration
+
+- **`module!`** — Metadata: name="hackbot", license="GPL", description="hackbot autonomous kernel agent with in-kernel LLM".
+
+### Submodules
+
+`config`, `types`, `state`, `context`, `net`, `tools`, `math`, `model`, `forward`, `tokenizer`, `agent`, `vllm`, `device` — all linked via `#[path]` attributes.
+
+---
+
+## `hackbot-kmod/hackbot_config.rs`
+
+Configuration constants for the entire kernel module.
+
+### Constants — vLLM
+
+- **`VLLM_ADDR: u32`** — `[100, 66, 136, 70]` (remote vLLM server IP).
+- **`VLLM_PORT: u16 = 8000`**
+- **`MAX_RESPONSE_SIZE: usize = 65536`** — 64 KB max response.
+- **`RECV_BUF_SIZE: usize = 4096`**
+- **`IPPROTO_TCP: i32 = 6`**
+
+### Constants — Agent Loop
+
+- **`MAX_AGENT_ITERATIONS: usize = 10`**
+- **`MAX_PS_TASKS: usize = 512`**
+- **`MAX_TOOL_OUTPUT: usize = 8192`**
+- **`MAX_CONVERSATION_SIZE: usize = 98304`**
+
+### Constants — System Prompts
+
+- **`SYSTEM_IDENTITY: &[u8]`** — Agent identity prompt.
+- **`TOOL_DESCRIPTION: &[u8]`** — Tool usage guidance.
+- **`LOCAL_SYSTEM_PROMPT: &[u8]`** — Compact prompt for local inference.
+- **`LOCAL_MAX_ITERATIONS: usize = 3`**
+- **`LOCAL_MAX_TOOL_OUTPUT: usize = 512`**
+
+### Constants — Model Format
+
+- **`MODEL_MAGIC: u32 = 0x484B4254`** — "HKBT" magic.
+- **`MODEL_FORMAT_V1: u32 = 1`** — INT8 + Q16.16 fixed-point.
+- **`MODEL_FORMAT_V2: u32 = 2`** — FP16 + float32 via FPU.
+- **`MODEL_HEADER_SIZE: usize = 56`**
+- **`MODEL_MAX_LAYERS: usize = 32`**, **`MODEL_MAX_VOCAB: usize = 65536`**
+- **`INFERENCE_MAX_SEQ: usize = 256`**
+
+### Constants — Token IDs
+
+- **`TOKEN_ENDOFTEXT: u32 = 0`**, **`TOKEN_IM_START: u32 = 1`**, **`TOKEN_IM_END: u32 = 2`**
+
+### Constants — Generation
+
+- **`MAX_GEN_TOKENS: usize = 128`**, **`MAX_ENCODE_INPUT: usize = 1024`**, **`MAX_PREPROC_INPUT: usize = 2048`**
+
+### Constants — Inference Modes
+
+- **`INFERENCE_MODE: u32 = 0`** (auto), **`INFERENCE_MODE_LOCAL: u32 = 1`**, **`INFERENCE_MODE_VLLM: u32 = 2`**
+
+---
+
+## `hackbot-kmod/hackbot_types.rs`
+
+Type definitions for model configuration, weight references, model state, and extern C FFI.
+
+### Structs
+
+- **`ModelConfig`** — `{ dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, group_size, head_dim, kv_dim, rope_theta }`.
+- **`Q8Ref`** — INT8 quantized weight matrix reference: `{ data_off, scale_off, rows, cols }`.
+- **`LayerRef`** — Transformer layer weight offsets: `{ rms_att_off, wq, wk, wv, wo, rms_ffn_off, gate, up, down }`.
+- **`ModelSlot`** — Global model state: loaded flag, data pointer/length, config, layer refs, tokenizer offsets, inference buffers (x, xb, xb2, hb, hb2, q, att, logits, key_cache, value_cache), vocab index, FPU state pointer.
+- **`SharedResponse`** — Device-global response buffer: `{ data: KVVec<u8>, offset: usize }`.
+
+### Extern "C" Declarations
+
+- **`avenrun: [c_ulong; 3]`** — Kernel load averages.
+- **`hackbot_fpu_alloc(dim, hidden_dim, n_layers, n_heads, n_kv_heads, head_dim, vocab_size, max_seq) -> *mut c_void`**
+- **`hackbot_fpu_free(state: *mut c_void)`**
+- **`hackbot_fpu_reset(state: *mut c_void)`**
+- **`hackbot_fpu_forward(state, weights, weights_len, token_id, pos) -> i32`**
+- **`hackbot_fpu_get_next_token(state: *mut c_void) -> i32`**
+
+---
+
+## `hackbot-kmod/hackbot_state.rs`
+
+Global mutable state shared across the module.
+
+### Globals
+
+- **`RESPONSE: Mutex<SharedResponse>`** — Device-global response buffer.
+- **`MODEL: Mutex<ModelSlot>`** — Model firmware state.
+
+---
+
+## `hackbot-kmod/hackbot_device.rs`
+
+MiscDevice implementation for `/dev/hackbot`.
+
+### Structs
+
+- **`HackbotModule`** — Pinned module registration container with `MiscDeviceRegistration`.
+- **`HackbotDev`** — Per-fd device state holding `Device` reference.
+
+### Trait Implementations
+
+- **`InPlaceModule for HackbotModule`**
+  - `init()` — Initialize globals, log vLLM endpoint.
+- **`MiscDevice for HackbotDev`**
+  - `open()` — Load model if needed.
+  - `write_iter()` — Accept prompt bytes, call `process_prompt()`, store response.
+  - `read_iter()` — Return buffered response data.
+
+---
+
+## `hackbot-kmod/hackbot_agent.rs`
+
+Local OODA agent loop with ChatML format.
+
+### Functions
+
+- **`agent_loop_local(prompt: &[u8]) -> Result<KVVec<u8>>`** — Main agent loop: gathers kernel context, builds ChatML conversation, iteratively calls tools based on `<tool>` tags in model output, returns final answer.
+
+### Private Functions
+
+- `append_chat_tokens()` — Append ChatML-formatted message to token array.
+- `begin_assistant_turn()` — Begin assistant turn in ChatML format.
+
+---
+
+## `hackbot-kmod/hackbot_vllm.rs`
+
+Remote vLLM inference backend with agent loop dispatcher.
+
+### Functions
+
+- **`agent_loop(prompt: &[u8]) -> Result<KVVec<u8>>`** — Dispatcher: selects local or vLLM based on `INFERENCE_MODE` and model availability.
+- **`process_prompt(prompt: &[u8]) -> KVVec<u8>`** — Process prompt through agent loop and format result.
+
+### Private Functions
+
+- `vllm_call(model_name, messages_json) -> Result<KVVec<u8>>` — Send request to vLLM `/v1/chat/completions`.
+- `discover_model_name() -> Result<KVVec<u8>>` — Query `/v1/models` endpoint.
+- `build_vllm_request(model_name, messages_json) -> Result<KVVec<u8>>` — Build HTTP POST request.
+- `agent_loop_vllm(prompt) -> Result<KVVec<u8>>` — OODA loop with vLLM backend.
+
+---
+
+## `hackbot-kmod/hackbot_forward.rs`
+
+Transformer forward pass with KV cache management.
+
+### Functions
+
+- **`alloc_inference_state(slot: &mut ModelSlot) -> Result`** — Allocate KV cache and activation buffers for both v1 (Q16.16) and v2 (FPU) formats.
+- **`reset_kv_cache(slot: &ModelSlot)`** — Zero KV cache between conversations.
+- **`forward_token(slot: &ModelSlot, token_id: usize, pos: usize)`** — Run one token through transformer. Dispatches to Q16.16 path (v1) or C FPU path (v2).
+
+---
+
+## `hackbot-kmod/hackbot_math.rs`
+
+Q16.16 fixed-point math primitives (pure scalar integer, no FPU/SIMD).
+
+### Constants
+
+- **`Q16_ONE: i32 = 65536`**, **`TWO_PI_Q16: i64 = 411775`**
+- **`EXP_TABLE: [i32; 17]`** — exp(-k) for k=0..16.
+- **`SIN_TABLE: [i32; 256]`** — sin(2π·k/256).
+- **`ROPE_FREQS_64: [i32; 32]`** — RoPE frequencies for head_dim=64.
+
+### Functions
+
+- **`isqrt_u64(n: u64) -> u64`** — Integer square root via Newton's method.
+- **`exp_q16_neg(x: i32) -> i32`** — exp(-x) for non-positive x.
+- **`sigmoid_q16(x: i32) -> i32`**, **`silu_q16(x: i32) -> i32`**
+- **`sin_q16(angle_q16: i32) -> i32`**, **`cos_q16(angle_q16: i32) -> i32`** — Trig via table lookup + interpolation.
+- **`matmul_q8(out, input, w_data, w_scales, rows, cols, gs)`** — INT8 × Q16.16 matrix-vector multiply.
+- **`rmsnorm_q16(out, input, weight, dim)`** — RMS normalization.
+- **`softmax_q16(x, len)`** — Softmax in-place.
+- **`rope_apply_q16(vec, pos, head_dim)`** — Rotary position encoding.
+- **`elementwise_mul_q16(out, a, b, len)`**, **`vec_add_q16(out, a, b, len)`**, **`silu_vec_q16(vec, len)`**, **`elementwise_mul_inplace_q16(a, b, len)`**
+- **`argmax_q16(data, len) -> usize`** — Index of maximum value.
+
+---
+
+## `hackbot-kmod/hackbot_model.rs`
+
+Model firmware loading and binary parsing.
+
+### Functions
+
+- **`read_u32_le(data: &[u8], off: usize) -> Result<u32>`**, **`read_u16_le(data: &[u8], off: usize) -> Result<u16>`** — Little-endian reads.
+- **`q8_ref_advance(cursor, rows, cols, gs, data_len) -> Result<Q8Ref>`** — Advance cursor past Q8 weight matrix.
+- **`norm_ref_advance(cursor, dim, data_len) -> Result<usize>`** — Advance cursor past RMSNorm weight.
+- **`load_model_if_needed(dev: &Device)`** — Load firmware on first device open.
+- **`free_model_resources()`** — Free all model allocations on module unload.
+
+### Private Functions
+
+- `parse_model_header(data: &[u8]) -> Result<ModelConfig>` — Parse binary header (magic, version, dimensions).
+- `parse_and_store_model(data, slot) -> Result` — Parse tokenizer + weights, compute layer offsets.
+
+---
+
+## `hackbot-kmod/hackbot_tokenizer.rs`
+
+GPT-2 BPE tokenizer for in-kernel use.
+
+### Constants
+
+- **`GPT2_BYTE_TO_CODEPOINT: [u16; 256]`** — Byte to Unicode codepoint mapping.
+- **`GPT2_CODEPOINT_TO_BYTE: [u8; 324]`** — Reverse mapping.
+
+### Functions
+
+- **`decode_token_bytes(data, tok_offsets, token_id) -> &[u8]`** — Decode token ID to BPE bytes.
+- **`get_token_score(data, tok_offsets, token_id) -> i32`** — Get BPE merge score.
+- **`gpt2_decode_token(token_bytes, out) -> usize`** — Decode GPT-2 encoded bytes to raw bytes.
+- **`find_token_by_bytes(data, tok_offsets, sorted, vocab_size, query) -> Option<u32>`** — Binary search sorted vocab.
+- **`build_sorted_vocab(slot) -> Result`** — Build sorted vocab index + byte-to-token lookup.
+- **`preprocess_gpt2(input, out) -> usize`** — GPT-2 byte preprocessing.
+- **`encode_bpe(slot, input, out_tokens) -> usize`** — Encode bytes to BPE token IDs.
+- **`get_next_token(slot) -> usize`** — Argmax from logits buffer.
+- **`generate_from_tokens(slot, prompt_tokens, n_prompt, output, max_new_tokens) -> usize`** — Autoregressive generation from token array.
+- **`generate(slot, prompt, output, max_new_tokens) -> usize`** — Generate from raw text prompt.
+
+---
+
+## `hackbot-kmod/hackbot_tools.rs`
+
+Kernel observation tools (Tier 0, read-only).
+
+### Enums
+
+- **`ToolCallResult<'a>`** — `ToolCall { name, prefix }` | `FinalAnswer(text)`.
+
+### Functions
+
+- **`parse_tool_call(response: &[u8]) -> ToolCallResult`** — Parse `<tool>NAME</tool>` tags from LLM output.
+- **`execute_tool(name: &[u8]) -> KVVec<u8>`** — Execute tool by name.
+
+### Private Tool Implementations
+
+- `tool_ps(output)` — List processes via `for_each_process` RCU walk. Formats PID, PPID, state, comm.
+- `tool_mem(output)` — Memory statistics via `si_meminfo()`: total, free, available, buffers, cached, swap.
+- `tool_loadavg(output)` — Load averages from `avenrun[]` + uptime.
+- `format_task(output, task)` — Format single `task_struct`.
+
+---
+
+## `hackbot-kmod/hackbot_context.rs`
+
+Kernel context gathering — provides system state to the LLM.
+
+### Functions
+
+- **`gather_kernel_context() -> KVVec<u8>`** — Gather and format live kernel state (version, uptime, CPUs, memory, current task).
+- **`append_uptime(buf: &mut KVVec<u8>)`** — Format uptime as d/h/m/s.
+- **`read_num_online_cpus() -> usize`** — Read online CPU count.
+
+---
+
+## `hackbot-kmod/hackbot_net.rs`
+
+Kernel socket wrapper and HTTP/JSON utilities.
+
+### Structs
+
+- **`SockaddrIn`** — IPv4 socket address struct.
+- **`KernelSocket`** — RAII wrapper around kernel socket with `Drop` impl.
+  - `connect_tcp(addr: u32, port: u16) -> Result<Self>` — Create and connect TCP socket.
+  - `send_all(&self, buf: &[u8]) -> Result<()>` — Send all bytes.
+  - `recv(&self, buf: &mut [u8]) -> Result<usize>` — Receive into buffer.
+  - `recv_all(&self, response, max_size) -> Result<()>` — Receive until EOF or max_size.
+
+### Functions
+
+- **`append_ipv4(buf, addr)`** — Format dotted-decimal IPv4.
+- **`json_escape(input, output)`** — Escape special chars for JSON.
+- **`append_message_to_json(messages, role, content)`** — Append chat message to JSON array.
+- **`find_http_body(raw) -> &[u8]`** — Find HTTP response body.
+- **`parse_http_status(raw) -> u16`** — Extract HTTP status code.
+- **`extract_text_from_json(json) -> Option<&[u8]>`** — Extract `"text"`/`"content"` field.
+- **`find_subsequence(haystack, needle) -> Option<usize>`**, **`find_json_string_end(json, start) -> Option<usize>`**
+- **`json_unescape(escaped, output)`** — Unescape JSON string.
+- **`format_usize(n, buf) -> &[u8]`** — Format usize as decimal ASCII (no heap).
+
+---
+
+## `hackbot-kmod/hackbot_fpu.c`
+
+Float32 FPU forward pass (C). SmolLM2-135M with FP16 weights, float32 activations.
+
+### Math Functions
+
+- **`fp16_to_f32(h: u16) -> float`** — Software FP16 to float32 conversion.
+- **`sqrtf_approx(x) -> float`** — Quake-style fast inverse square root.
+- **`expf_approx(x) -> float`**, **`sinf_approx(x) -> float`**, **`cosf_approx(x) -> float`** — Fast math approximations.
+- **`matmul_fp16(out, x, w_fp16, rows, cols)`** — Matrix-vector multiply with FP16 weights.
+- **`rmsnorm_f32(out, x, weight_data, dim)`**, **`rope_f32(vec, pos, head_dim)`**, **`softmax_f32(x, len)`**, **`silu_f32(x)`**
+
+### Public API (called from Rust via FFI)
+
+- **`hackbot_fpu_alloc(...) -> void*`** — Allocate inference state (KV cache + activation buffers).
+- **`hackbot_fpu_free(state)`** — Free all allocations.
+- **`hackbot_fpu_reset(state)`** — Zero KV cache.
+- **`hackbot_fpu_forward(state, weights, weights_len, token_id, pos) -> int`** — Forward pass with `kernel_fpu_begin/end` guards.
+- **`hackbot_fpu_get_next_token(state) -> int`** — Argmax with FPU context guard.
+
+### Private
+
+- `forward_token_impl(st, weights, token_id, pos)` — Core transformer (embedding → layers → logits).
+
+---
+
+## `hackbot-kmod/hackbot_fpu.h`
+
+C header for FPU inference engine. Declares `hackbot_fpu_alloc`, `hackbot_fpu_free`, `hackbot_fpu_reset`, `hackbot_fpu_forward`, `hackbot_fpu_get_next_token`.
+
+---
+
+## `hackbot-kmod/kernel_version.rs`
+
+Auto-generated by Kbuild. Contains `pub(crate) const KERNEL_RELEASE: &[u8] = b"6.19.8"`.
+
+---
+
+# tools/ — Python Utilities
+
+---
+
+## `tools/export_hackbot.py`
+
+Exports HuggingFace SmolLM2-135M-Instruct to hackbot binary format v1 (INT8 + Q16.16).
+
+### Constants
+
+- `MAGIC = 0x484B4254`, `FORMAT_VERSION = 1`, `Q16_SHIFT = 16`
+
+### Functions
+
+- **`quantize_tensor_q8(tensor: np.ndarray, group_size: int) -> tuple[np.ndarray, np.ndarray]`** — Quantize float tensor to INT8 with per-group Q16.16 scales.
+- **`float_to_q16(arr: np.ndarray) -> np.ndarray`** — Convert float32 array to Q16.16 int32.
+- **`export_tokenizer(tokenizer, vocab_size: int) -> bytes`** — Export vocabulary with BPE merge scores to binary.
+- **`export_model(model_name: str, output_path: str, group_size: int = 64)`** — Main export: load HF model, quantize weights, write binary file.
+- **`main()`** — CLI entry point.
+
+---
+
+## `tools/export_hackbot_fp16.py`
+
+Exports SmolLM2-135M to hackbot binary format v2 (FP16 weights, no quantization).
+
+### Constants
+
+- `MAGIC = 0x484B4254`, `FORMAT_VERSION = 2`
+
+### Functions
+
+- **`export_tokenizer(tokenizer, vocab_size: int) -> bytes`** — Same as v1.
+- **`export_model_fp16(model_name: str, output_path: str)`** — Export FP16 weights directly (no quantization).
+- **`main()`** — CLI entry point.
+
+---
+
+## `tools/int8_reference.py`
+
+Python reference implementation of hackbot INT8 forward pass.
+
+### Constants
+
+- `Q16_SHIFT`, `Q16_ONE`, `MODEL_MAGIC`, `INFERENCE_MAX_SEQ`, `ROPE_FREQS_64`, `TWO_PI_Q16`, `EXP_TABLE`, `SIN_TABLE`
+
+### Functions
+
+- **`sin_q16(theta)`**, **`cos_q16(theta)`**, **`isqrt_u64(n)`** — Q16.16 math matching kernel code.
+
+### Classes
+
+- **`HackbotModel`**
+  - `__init__(self, path)` — Load and parse hackbot binary file.
+  - `matmul_q8(self, x_q16, w_offset, rows, cols)` — INT8 × Q16.16 matmul matching kernel exactly.
+  - `rmsnorm_q16(self, x_q16, weight_offset, dim)` — RMSNorm in Q16.16.
+  - `rope_apply(self, vec, pos, head_dim)` — RoPE application.
+  - `softmax_q16(self, x, length)` — Softmax in Q16.16.
+  - `silu_q16(self, x)` — SiLU activation.
+  - `forward_token(self, token_id, pos)` — Full forward pass for one token.
+
+---
+
+## `tools/verify_hackbot.py`
+
+Comprehensive INT8 inference verification.
+
+### Functions
+
+- **`load_hackbot_bin(path: str)`** — Parse binary, return (data, config, tokens, offset).
+- **`dequantize_q8(data, offset, rows, cols, group_size)`** — Dequantize INT8 weights to float32.
+- **`compare_weights(bin_path: str, model_name: str)`** — Compare all weights + forward pass against HF reference.
+- **`bytes_to_unicode()`** — GPT-2 bytes_to_unicode mapping.
+- **`main()`** — CLI entry point.
+
+---
+
+## `tools/verify_prefill.py`
+
+Multi-token prefill verification with numpy-vectorized INT8.
+
+### Classes
+
+- **`FastHackbotModel`**
+  - `__init__(self, path)` — Load model and pre-load weights as numpy arrays.
+  - `matmul_q8_fast(self, x_q16, w_i8, scales, rows, cols)` — Vectorized INT8 matmul.
+  - `rmsnorm_fast(self, x_q16, weights)`, `rope_apply()`, `softmax_q16()`, `silu_q16_vec()`
+  - `forward_token(self, token_id, pos, verbose=False)` — Full forward pass with numpy.
+- **`main()`** — Single-token and full prefill tests with float32 comparison.
+
+---
+
+## `tools/verify_tokenizer.py`
+
+BPE tokenizer verification against HuggingFace reference.
+
+### Constants
+
+- `GPT2_BYTE_TO_CODEPOINT[256]` — Matching kernel's byte-to-codepoint mapping.
+
+### Classes
+
+- **`HackbotTokenizer`**
+  - `__init__(self, bin_path)` — Load tokenizer from binary, build sorted vocab.
+  - `preprocess_gpt2(self, input_bytes)` — GPT-2 byte preprocessing matching kernel.
+  - `encode_bpe(self, input_bytes)` — BPE encoding matching kernel's `encode_bpe` exactly.
+  - `decode_tokens(self, token_ids)` — Decode token IDs to bytes.
+- **`main()`** — Test encoding/decoding, compare with HuggingFace tokenizer.
+
+---
+
+## `tools/verify_generation.py`
+
+Quick ChatML generation verification. Script-style (no function definitions). Loads HF model, applies ChatML template, generates greedy text, outputs token-by-token predictions.

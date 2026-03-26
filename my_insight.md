@@ -63,3 +63,9 @@ Before we get into it, let's update docs and commit.
 And please proceed the plan with ultra think and careful implement.
 if you have any concerns, please let me know.
 
+
+/task_easy ok. the remained step is Task 5 (FP16/FPU debug)? but in my piece of opinion, if it might
+  takke too much time waste, it can be better to defer it a little and step forward the next steps. but now
+  I'm not sure. how do you think?? and what's the remained steps??
+
+
