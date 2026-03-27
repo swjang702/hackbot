@@ -59,23 +59,38 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
+/// Split a raw tool invocation into (name, args).
+/// e.g. `b"files 1234"` → `(b"files", b"1234")`, `b"ps"` → `(b"ps", b"")`.
+fn split_tool_args(raw: &[u8]) -> (&[u8], &[u8]) {
+    match raw.iter().position(|&b| b == b' ') {
+        Some(pos) => (&raw[..pos], trim_ascii(&raw[pos + 1..])),
+        None => (raw, &[] as &[u8]),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool execution
 // ---------------------------------------------------------------------------
 
-/// Execute a tool by name and return its output.
-pub(crate) fn execute_tool(name: &[u8]) -> KVVec<u8> {
+/// Execute a tool by name (with optional arguments) and return its output.
+/// `raw` is the full content between `<tool>` and `</tool>` tags,
+/// e.g. `b"ps"`, `b"files 1234"`, or `b"kprobe attach do_sys_openat2"`.
+pub(crate) fn execute_tool(raw: &[u8]) -> KVVec<u8> {
+    let (name, args) = split_tool_args(raw);
     let mut output = KVVec::new();
 
     match name {
         b"ps" => tool_ps(&mut output),
         b"mem" => tool_mem(&mut output),
         b"loadavg" => tool_loadavg(&mut output),
+        b"dmesg" => tool_dmesg(&mut output, args),
+        b"files" => tool_files(&mut output, args),
+        b"kprobe" => tool_kprobe(&mut output, args),
         _ => {
             let _ = output.extend_from_slice(b"[Error: unknown tool '", GFP_KERNEL);
             let _ = output.extend_from_slice(name, GFP_KERNEL);
             let _ = output.extend_from_slice(
-                b"'. Available tools: ps, mem, loadavg]\n",
+                b"'. Available tools: ps, mem, loadavg, dmesg, files, kprobe]\n",
                 GFP_KERNEL,
             );
         }
@@ -296,4 +311,233 @@ fn tool_loadavg(output: &mut KVVec<u8>) {
     let _ = output.extend_from_slice(b"Uptime:      ", GFP_KERNEL);
     append_uptime(output);
     let _ = output.push(b'\n', GFP_KERNEL);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 0: dmesg — kernel log ring buffer
+// ---------------------------------------------------------------------------
+
+/// Parse a decimal integer from ASCII bytes. Returns 0 on empty/invalid input.
+fn parse_usize(s: &[u8]) -> usize {
+    let mut n: usize = 0;
+    for &b in s {
+        if b.is_ascii_digit() {
+            n = n.saturating_mul(10).saturating_add((b - b'0') as usize);
+        } else {
+            break;
+        }
+    }
+    n
+}
+
+/// Tool: `dmesg [N]` — read recent kernel log messages from our console ring buffer.
+/// Optional argument N limits output to the last N lines.
+fn tool_dmesg(output: &mut KVVec<u8>, args: &[u8]) {
+    // Read from console ring buffer (C helper).
+    let max_read: usize = MAX_TOOL_OUTPUT - 256; // leave room for header
+    let mut buf = KVVec::new();
+    if buf.resize(max_read, 0, GFP_KERNEL).is_err() {
+        let _ = output.extend_from_slice(b"[Error: failed to allocate dmesg buffer]\n", GFP_KERNEL);
+        return;
+    }
+
+    let n = unsafe {
+        crate::types::hackbot_console_read(buf.as_mut_ptr(), max_read as i32)
+    };
+
+    if n <= 0 {
+        let _ = output.extend_from_slice(b"[No kernel messages captured yet]\n", GFP_KERNEL);
+        return;
+    }
+
+    let data = &buf[..n as usize];
+
+    // If a line count was given, extract last N lines.
+    let max_lines = if !args.is_empty() { parse_usize(args) } else { 0 };
+
+    let display = if max_lines > 0 {
+        // Scan backward for newlines to find the start of the last N lines.
+        let mut newline_count = 0usize;
+        let mut start = data.len();
+        for i in (0..data.len()).rev() {
+            if data[i] == b'\n' {
+                newline_count += 1;
+                if newline_count > max_lines {
+                    start = i + 1;
+                    break;
+                }
+            }
+        }
+        &data[start..]
+    } else {
+        data
+    };
+
+    let _ = output.extend_from_slice(b"=== Kernel Log", GFP_KERNEL);
+    if max_lines > 0 {
+        let mut num = [0u8; 20];
+        let _ = output.extend_from_slice(b" (last ", GFP_KERNEL);
+        let _ = output.extend_from_slice(format_usize(max_lines, &mut num), GFP_KERNEL);
+        let _ = output.extend_from_slice(b" lines)", GFP_KERNEL);
+    }
+    let _ = output.extend_from_slice(b" ===\n", GFP_KERNEL);
+    let _ = output.extend_from_slice(display, GFP_KERNEL);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 0: files — list open file descriptors for a process
+// ---------------------------------------------------------------------------
+
+/// Tool: `files <pid>` — list open file descriptors for a process.
+fn tool_files(output: &mut KVVec<u8>, args: &[u8]) {
+    if args.is_empty() || !args[0].is_ascii_digit() {
+        let _ = output.extend_from_slice(
+            b"Usage: <tool>files PID</tool>\nExample: <tool>files 1</tool>\n\
+              Lists all open file descriptors for the given process.\n",
+            GFP_KERNEL,
+        );
+        return;
+    }
+
+    let pid = parse_usize(args) as i32;
+
+    let buf_size: usize = MAX_TOOL_OUTPUT - 256;
+    let mut buf = KVVec::new();
+    if buf.resize(buf_size, 0, GFP_KERNEL).is_err() {
+        let _ = output.extend_from_slice(b"[Error: failed to allocate files buffer]\n", GFP_KERNEL);
+        return;
+    }
+
+    let n = unsafe {
+        crate::types::hackbot_list_fds(pid, buf.as_mut_ptr(), buf_size as i32)
+    };
+
+    if n < 0 {
+        let _ = output.extend_from_slice(b"[Error: ", GFP_KERNEL);
+        match n {
+            -3 => { // ESRCH
+                let _ = output.extend_from_slice(b"no process with PID ", GFP_KERNEL);
+                let mut num = [0u8; 20];
+                let _ = output.extend_from_slice(
+                    format_usize(pid as usize, &mut num), GFP_KERNEL,
+                );
+            }
+            _ => {
+                let _ = output.extend_from_slice(b"errno ", GFP_KERNEL);
+                let mut num = [0u8; 20];
+                let _ = output.extend_from_slice(
+                    format_usize((-n) as usize, &mut num), GFP_KERNEL,
+                );
+            }
+        }
+        let _ = output.extend_from_slice(b"]\n", GFP_KERNEL);
+        return;
+    }
+
+    let _ = output.extend_from_slice(b"=== Open Files for PID ", GFP_KERNEL);
+    let mut num = [0u8; 20];
+    let _ = output.extend_from_slice(format_usize(pid as usize, &mut num), GFP_KERNEL);
+    let _ = output.extend_from_slice(b" ===\n", GFP_KERNEL);
+    let _ = output.extend_from_slice(&buf[..n as usize], GFP_KERNEL);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: kprobe — kernel function instrumentation
+// ---------------------------------------------------------------------------
+
+/// Tool: `kprobe <subcommand> [args]`
+///   - `kprobe attach <func>` — attach a kprobe to a kernel function
+///   - `kprobe check`         — show all active kprobes with hit counts
+///   - `kprobe detach <func>` — remove a kprobe from a function
+fn tool_kprobe(output: &mut KVVec<u8>, args: &[u8]) {
+    let (subcmd, subargs) = split_tool_args(args);
+
+    match subcmd {
+        b"attach" => {
+            if subargs.is_empty() {
+                let _ = output.extend_from_slice(
+                    b"Usage: <tool>kprobe attach FUNCTION</tool>\n\
+                      Example: <tool>kprobe attach do_sys_openat2</tool>\n",
+                    GFP_KERNEL,
+                );
+                return;
+            }
+            let ret = unsafe {
+                crate::types::hackbot_kprobe_attach(subargs.as_ptr(), subargs.len() as i32)
+            };
+            if ret < 0 {
+                let _ = output.extend_from_slice(b"[Error: failed to attach kprobe '", GFP_KERNEL);
+                let _ = output.extend_from_slice(subargs, GFP_KERNEL);
+                let _ = output.extend_from_slice(b"': ", GFP_KERNEL);
+                match ret {
+                    -28 => { let _ = output.extend_from_slice(b"all kprobe slots full (max 8), detach one first", GFP_KERNEL); } // ENOSPC
+                    -17 => { let _ = output.extend_from_slice(b"kprobe already attached to this function", GFP_KERNEL); } // EEXIST
+                    -2  => { let _ = output.extend_from_slice(b"function not found in kernel", GFP_KERNEL); } // ENOENT
+                    -22 => { let _ = output.extend_from_slice(b"function cannot be probed (blacklisted)", GFP_KERNEL); } // EINVAL
+                    _ => {
+                        let _ = output.extend_from_slice(b"errno ", GFP_KERNEL);
+                        let mut num = [0u8; 20];
+                        let _ = output.extend_from_slice(
+                            format_usize((-ret) as usize, &mut num), GFP_KERNEL,
+                        );
+                    }
+                }
+                let _ = output.extend_from_slice(b"]\n", GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(b"Kprobe attached to '", GFP_KERNEL);
+                let _ = output.extend_from_slice(subargs, GFP_KERNEL);
+                let _ = output.extend_from_slice(b"' successfully. Use <tool>kprobe check</tool> to see hit counts.\n", GFP_KERNEL);
+            }
+        }
+        b"check" => {
+            let buf_size: usize = MAX_TOOL_OUTPUT - 256;
+            let mut buf = KVVec::new();
+            if buf.resize(buf_size, 0, GFP_KERNEL).is_err() {
+                let _ = output.extend_from_slice(b"[Error: alloc failed]\n", GFP_KERNEL);
+                return;
+            }
+            let n = unsafe {
+                crate::types::hackbot_kprobe_check(buf.as_mut_ptr(), buf_size as i32)
+            };
+            let _ = output.extend_from_slice(b"=== Active Kprobes ===\n", GFP_KERNEL);
+            if n <= 0 {
+                let _ = output.extend_from_slice(b"[No active kprobes]\n", GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(&buf[..n as usize], GFP_KERNEL);
+            }
+        }
+        b"detach" => {
+            if subargs.is_empty() {
+                let _ = output.extend_from_slice(
+                    b"Usage: <tool>kprobe detach FUNCTION</tool>\n\
+                      Example: <tool>kprobe detach do_sys_openat2</tool>\n",
+                    GFP_KERNEL,
+                );
+                return;
+            }
+            let ret = unsafe {
+                crate::types::hackbot_kprobe_detach(subargs.as_ptr(), subargs.len() as i32)
+            };
+            if ret < 0 {
+                let _ = output.extend_from_slice(b"[Error: no active kprobe on '", GFP_KERNEL);
+                let _ = output.extend_from_slice(subargs, GFP_KERNEL);
+                let _ = output.extend_from_slice(b"']\n", GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(b"Kprobe detached from '", GFP_KERNEL);
+                let _ = output.extend_from_slice(subargs, GFP_KERNEL);
+                let _ = output.extend_from_slice(b"'.\n", GFP_KERNEL);
+            }
+        }
+        _ => {
+            let _ = output.extend_from_slice(
+                b"Usage: kprobe <subcommand>\n\
+                  Subcommands:\n\
+                  \x20 <tool>kprobe attach FUNC</tool>  - attach kprobe to kernel function\n\
+                  \x20 <tool>kprobe check</tool>         - show active kprobes and hit counts\n\
+                  \x20 <tool>kprobe detach FUNC</tool>  - remove kprobe from function\n\n\
+                  Example: <tool>kprobe attach do_sys_openat2</tool>\n",
+                GFP_KERNEL,
+            );
+        }
+    }
 }

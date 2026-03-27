@@ -36,6 +36,10 @@ impl kernel::InPlaceModule for HackbotModule {
         unsafe { MODEL.init() };
 
         pr_info!("hackbot: loading module, creating /dev/hackbot\n");
+
+        // Register console driver to capture kernel log messages for dmesg tool.
+        unsafe { crate::types::hackbot_console_init() };
+
         pr_info!(
             "hackbot: vLLM endpoint = {}.{}.{}.{}:{}\n",
             (VLLM_ADDR >> 24) & 0xFF,
@@ -58,7 +62,11 @@ impl kernel::InPlaceModule for HackbotModule {
 #[pinned_drop]
 impl PinnedDrop for HackbotModule {
     fn drop(self: Pin<&mut Self>) {
+        // Clean up kprobes before unloading.
+        unsafe { crate::types::hackbot_kprobe_cleanup() };
         free_model_resources();
+        // Unregister console driver last (so cleanup messages are still captured).
+        unsafe { crate::types::hackbot_console_exit() };
         pr_info!("hackbot: unloading module\n");
     }
 }

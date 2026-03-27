@@ -141,6 +141,29 @@ extern "C" {
     ) -> i32;
 
     pub(crate) fn hackbot_fpu_get_next_token(state: *const core::ffi::c_void) -> i32;
+
+    // --- hackbot_console.c: kernel log ring buffer via console driver ---
+
+    pub(crate) fn hackbot_console_init() -> i32;
+    pub(crate) fn hackbot_console_exit();
+    /// Read last `maxlen` bytes from the console ring buffer. Returns bytes copied.
+    pub(crate) fn hackbot_console_read(out: *mut u8, maxlen: i32) -> i32;
+
+    // --- hackbot_files.c: open file descriptor listing ---
+
+    /// List open FDs for a process. Returns bytes written, or -errno on error.
+    pub(crate) fn hackbot_list_fds(pid: i32, out: *mut u8, maxlen: i32) -> i32;
+
+    // --- hackbot_kprobe.c: kprobe instrumentation ---
+
+    /// Attach a kprobe to a kernel function. Returns 0 on success, -errno on error.
+    pub(crate) fn hackbot_kprobe_attach(symbol: *const u8, len: i32) -> i32;
+    /// List active kprobes with hit counts. Returns bytes written.
+    pub(crate) fn hackbot_kprobe_check(out: *mut u8, maxlen: i32) -> i32;
+    /// Detach a kprobe. Returns 0 on success, -errno on error.
+    pub(crate) fn hackbot_kprobe_detach(symbol: *const u8, len: i32) -> i32;
+    /// Unregister all active kprobes (called on module unload).
+    pub(crate) fn hackbot_kprobe_cleanup();
 }
 
 // Compile-time check: avenrun declaration assumes 64-bit unsigned long.

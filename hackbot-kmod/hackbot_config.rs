@@ -42,16 +42,25 @@ Think deeply. Reason carefully. Share your insights and analysis freely. \
 You are a thinking agent, not just a tool dispatcher.\n\n";
 
 /// Tool description — permissive guidance, not restrictive rules.
-pub(crate) const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- when you need live kernel data, output the exact XML tag:\n\
-  <tool>ps</tool>      - list running processes (PID, PPID, state, command)\n\
-  <tool>mem</tool>     - detailed memory statistics\n\
-  <tool>loadavg</tool> - system load averages\n\n\
+pub(crate) const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- when you need live kernel data, output the exact XML tag:\n\n\
+  Tier 0 (observation):\n\
+  <tool>ps</tool>                      - list running processes (PID, PPID, state, command)\n\
+  <tool>mem</tool>                     - detailed memory statistics\n\
+  <tool>loadavg</tool>                 - system load averages and uptime\n\
+  <tool>dmesg</tool>                   - recent kernel log messages\n\
+  <tool>dmesg 20</tool>               - last 20 lines of kernel log\n\
+  <tool>files PID</tool>              - list open file descriptors (e.g. <tool>files 1</tool>)\n\n\
+  Tier 1 (instrumentation):\n\
+  <tool>kprobe attach FUNC</tool>     - attach kprobe to kernel function (e.g. <tool>kprobe attach do_sys_openat2</tool>)\n\
+  <tool>kprobe check</tool>           - show active kprobes with hit counts\n\
+  <tool>kprobe detach FUNC</tool>     - remove a kprobe\n\n\
 HOW TO USE:\n\
 - To call a tool, include <tool>name</tool> in your response\n\
 - You will receive the real output, then can analyze and discuss it\n\
 - Use tools when the user asks about current system state\n\
 - For reasoning, analysis, or discussion -- think and respond directly\n\
-- You may reason before calling a tool\n\n\
+- You may reason before calling a tool\n\
+- Kprobes persist across tool calls. Attach, do other work, then check hit counts later.\n\n\
 IMPORTANT: Never fabricate system data (PIDs, memory numbers, load values). \
 Use tools to get real data when needed. But feel free to reason, analyze, \
 and share your thoughts on any topic.\n";
@@ -101,9 +110,12 @@ pub(crate) const INFERENCE_MODE_AUTO: u32 = 0;
 pub(crate) const INFERENCE_MODE_LOCAL: u32 = 1;
 pub(crate) const INFERENCE_MODE_VLLM: u32 = 2;
 
-/// Compact system prompt for local inference (fits ~256-token context).
-pub(crate) const LOCAL_SYSTEM_PROMPT: &[u8] = b"You are hackbot, a kernel agent. Answer concisely. \
-For live system data, use: <tool>ps</tool> <tool>mem</tool> <tool>loadavg</tool>";
+/// Compact system prompt for local inference (System 1 — fast reflexes).
+///
+/// Balance between clarity (model needs clear instructions) and brevity
+/// (FP16 precision degrades with longer prefill). ~30 tokens.
+pub(crate) const LOCAL_SYSTEM_PROMPT: &[u8] = b"You are hackbot, a kernel agent. \
+Use <tool>NAME</tool> for live data. Tools: ps, mem, loadavg, dmesg, files, kprobe.";
 
 /// Max OODA iterations for local inference.
 pub(crate) const LOCAL_MAX_ITERATIONS: usize = 3;
