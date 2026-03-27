@@ -507,6 +507,14 @@ Type definitions for model configuration, weight references, model state, and ex
 - **`hackbot_fpu_reset(state: *mut c_void)`**
 - **`hackbot_fpu_forward(state, weights, weights_len, token_id, pos) -> i32`**
 - **`hackbot_fpu_get_next_token(state: *mut c_void) -> i32`**
+- **`hackbot_console_init() -> i32`** — Register console driver for dmesg ring buffer.
+- **`hackbot_console_exit()`** — Unregister console driver.
+- **`hackbot_console_read(out: *mut u8, maxlen: i32) -> i32`** — Copy last N bytes from ring buffer.
+- **`hackbot_list_fds(pid: i32, out: *mut u8, maxlen: i32) -> i32`** — List open FDs for a process.
+- **`hackbot_kprobe_attach(symbol: *const u8, len: i32) -> i32`** — Attach kprobe to kernel function.
+- **`hackbot_kprobe_check(out: *mut u8, maxlen: i32) -> i32`** — List active kprobes with hit counts.
+- **`hackbot_kprobe_detach(symbol: *const u8, len: i32) -> i32`** — Remove a kprobe.
+- **`hackbot_kprobe_cleanup()`** — Unregister all kprobes (called on rmmod).
 
 ---
 
@@ -657,7 +665,7 @@ GPT-2 BPE tokenizer for in-kernel use.
 
 ## `hackbot-kmod/hackbot_tools.rs`
 
-Kernel observation tools (Tier 0, read-only).
+Kernel tools (Tier 0 observation + Tier 1 instrumentation). 6 tools total.
 
 ### Enums
 
@@ -665,14 +673,25 @@ Kernel observation tools (Tier 0, read-only).
 
 ### Functions
 
-- **`parse_tool_call(response: &[u8]) -> ToolCallResult`** — Parse `<tool>NAME</tool>` tags from LLM output.
-- **`execute_tool(name: &[u8]) -> KVVec<u8>`** — Execute tool by name.
+- **`parse_tool_call(response: &[u8]) -> ToolCallResult`** — Parse `<tool>NAME args</tool>` tags from LLM output.
+- **`execute_tool(raw: &[u8]) -> KVVec<u8>`** — Split name/args via `split_tool_args()`, dispatch to tool function.
+- `split_tool_args(raw) -> (&[u8], &[u8])` — Split `"files 1234"` → `("files", "1234")`.
+- `parse_usize(s: &[u8]) -> usize` — Parse decimal integer from ASCII bytes.
 
-### Private Tool Implementations
+### Tool Implementations (Tier 0 — observation)
 
 - `tool_ps(output)` — List processes via `for_each_process` RCU walk. Formats PID, PPID, state, comm.
 - `tool_mem(output)` — Memory statistics via `si_meminfo()`: total, free, available, buffers, cached, swap.
 - `tool_loadavg(output)` — Load averages from `avenrun[]` + uptime.
+- `tool_dmesg(output, args)` — Read kernel log from console ring buffer. Optional line count arg.
+- `tool_files(output, args)` — List open FDs for a PID via C helper `hackbot_list_fds()`.
+
+### Tool Implementations (Tier 1 — instrumentation)
+
+- `tool_kprobe(output, args)` — Dispatch kprobe subcommands: `attach <func>`, `check`, `detach <func>`.
+
+### Private Helpers
+
 - `format_task(output, task)` — Format single `task_struct`.
 
 ---
@@ -734,17 +753,71 @@ Float32 FPU forward pass (C). SmolLM2-135M with FP16 weights, float32 activation
 - **`hackbot_fpu_free(state)`** — Free all allocations.
 - **`hackbot_fpu_reset(state)`** — Zero KV cache.
 - **`hackbot_fpu_forward(state, weights, weights_len, token_id, pos) -> int`** — Forward pass with `kernel_fpu_begin/end` guards.
-- **`hackbot_fpu_get_next_token(state) -> int`** — Argmax with FPU context guard.
+- **`hackbot_fpu_get_next_token(state) -> int`** — Temperature + top-k sampling (T=0.70, K=40) with kernel CSPRNG. Set `HACKBOT_TEMPERATURE=0` for greedy argmax.
+
+### Configuration Constants
+
+- `HACKBOT_TEMPERATURE` (70 = 0.70) — sampling temperature, 0 = greedy
+- `HACKBOT_TOP_K` (40) — number of top candidates to consider
 
 ### Private
 
-- `forward_token_impl(st, weights, token_id, pos)` — Core transformer (embedding → layers → logits).
+- `forward_token_impl(st, weights, token_id, pos)` — Core transformer (embedding → layers → logits). Debug logging at pos==0.
 
 ---
 
 ## `hackbot-kmod/hackbot_fpu.h`
 
 C header for FPU inference engine. Declares `hackbot_fpu_alloc`, `hackbot_fpu_free`, `hackbot_fpu_reset`, `hackbot_fpu_forward`, `hackbot_fpu_get_next_token`.
+
+---
+
+## `hackbot-kmod/hackbot_console.c`
+
+Console ring buffer — captures kernel log messages for the `dmesg` tool.
+
+### Functions
+
+- **`hackbot_console_init() -> int`** — Register console driver. Call on module init.
+- **`hackbot_console_exit()`** — Unregister console driver. Call on module exit.
+- **`hackbot_console_read(out, maxlen) -> int`** — Copy last `maxlen` bytes from 64KB ring buffer.
+
+### Private
+
+- `hackbot_console_write(con, s, count)` — Console write callback. Runs in ANY context (IRQ-safe via raw_spinlock).
+
+---
+
+## `hackbot-kmod/hackbot_files.c`
+
+FD listing — walks process file descriptor table for the `files` tool.
+
+### Functions
+
+- **`hackbot_list_fds(pid, out, maxlen) -> int`** — List open FDs for process. Returns bytes written or `-ESRCH`/`-ENOMEM`.
+
+### Private
+
+- `append_num(out, pos, maxlen, val) -> int` — Append decimal number to buffer.
+- `append_str(out, pos, maxlen, s, slen) -> int` — Append string to buffer.
+
+---
+
+## `hackbot-kmod/hackbot_kprobe.c`
+
+Kprobe manager — attach/check/detach kernel function probes for the `kprobe` tool.
+
+### Functions
+
+- **`hackbot_kprobe_attach(symbol, len) -> int`** — Register kprobe. Returns 0 or `-ENOSPC`/`-EEXIST`/`-ENOENT`.
+- **`hackbot_kprobe_check(out, maxlen) -> int`** — List active kprobes with hit counts.
+- **`hackbot_kprobe_detach(symbol, len) -> int`** — Unregister kprobe. Returns 0 or `-ENOENT`.
+- **`hackbot_kprobe_cleanup()`** — Unregister ALL kprobes. Called on module unload.
+
+### Private
+
+- `hackbot_kprobe_pre_handler(p, regs) -> int` — Kprobe hit handler: `atomic64_inc(&count)`.
+- `struct hackbot_kprobe_slot` — `{ active, symbol[64], count: atomic64_t, kp: struct kprobe }`.
 
 ---
 

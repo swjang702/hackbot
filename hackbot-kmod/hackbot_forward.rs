@@ -117,12 +117,16 @@ pub(crate) fn forward_token(slot: &ModelSlot, token_id: usize, pos: usize) {
     if slot.format_version == MODEL_FORMAT_V2 {
         let weights = (slot.data_addr + slot.weights_off) as *const core::ffi::c_void;
         let weights_len = slot.data_len - slot.weights_off;
-        unsafe {
+        let ret = unsafe {
             hackbot_fpu_forward(
                 slot.fpu_state as *mut core::ffi::c_void,
                 weights, weights_len,
                 token_id as i32, pos as i32,
-            );
+            )
+        };
+        if ret != 0 {
+            pr_err!("hackbot: FPU forward failed: ret={} (token={}, pos={})\n",
+                    ret, token_id, pos);
         }
         return;
     }

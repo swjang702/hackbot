@@ -11,6 +11,7 @@
 - Sequential Monte Carlo
 - DNA sequencing
 - Probabilistics: Markov chain
+- linear algebra, vector
 
 
 # TODO
@@ -18,7 +19,7 @@
 
 
 # My inqueries 
-* /task_easy ok looks fine. please proceed the next step in ultra think and very careful implementation.
+* /task_easy ok looks fine. please proceed the plan in careful thinking and implementation.
 * /task_easy please resume the stopped task in ultra think.
 * /task_easy ultra think that .... What are your thoughts and a plan?
 
@@ -67,5 +68,9 @@ if you have any concerns, please let me know.
 /task_easy ok. the remained step is Task 5 (FP16/FPU debug)? but in my piece of opinion, if it might
   takke too much time waste, it can be better to defer it a little and step forward the next steps. but now
   I'm not sure. how do you think?? and what's the remained steps??
+
+
+
+
 
 

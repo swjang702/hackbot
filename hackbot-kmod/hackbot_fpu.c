@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/math64.h>
+#include <linux/random.h>
 #include <asm/fpu/api.h>
 
 #include "hackbot_fpu.h"
@@ -35,6 +36,20 @@
 
 /* RMSNorm epsilon */
 #define RMS_EPS 1e-5f
+
+/*
+ * Sampling parameters for token generation.
+ *
+ * Pure greedy (argmax) causes repetitive output on small FP16 models.
+ * Temperature + top-k sampling breaks repetition while staying coherent.
+ *
+ * HACKBOT_TEMPERATURE: 0 = greedy (argmax), 70 = 0.70, 100 = 1.0
+ *   Lower → more deterministic, higher → more creative.
+ * HACKBOT_TOP_K: number of top tokens to consider (0 = full vocab).
+ *   Higher → more diverse, lower → more focused.
+ */
+#define HACKBOT_TEMPERATURE   70    /* 0.70 — good balance for small models */
+#define HACKBOT_TOP_K         40    /* consider top 40 tokens */
 
 /* ===================================================================
  * FP16 → float32 conversion (software, no SSE/AVX needed)
@@ -369,6 +384,13 @@ static void forward_token_impl(struct hackbot_fpu_state *st,
 		const u16 *row = embed + (size_t)token_id * dim;
 		for (d = 0; d < dim; d++)
 			x[d] = fp16_to_f32(row[d]);
+
+		if (pos == 0) {
+			pr_info("hackbot_fpu: embed[%d]: x[0..4] = [%d, %d, %d, %d] (x1000)\n",
+				token_id,
+				(int)(x[0] * 1000), (int)(x[1] * 1000),
+				(int)(x[2] * 1000), (int)(x[3] * 1000));
+		}
 	}
 
 	/* === Step 2: Transformer layers === */
@@ -461,6 +483,12 @@ static void forward_token_impl(struct hackbot_fpu_state *st,
 		/* 2j: Residual */
 		for (d = 0; d < dim; d++)
 			x[d] += xb2[d];
+
+		if (pos == 0 && (l == 0 || l == c->n_layers - 1)) {
+			pr_info("hackbot_fpu: layer %d: x[0..4] = [%d, %d, %d, %d] (x1000)\n",
+				l, (int)(x[0] * 1000), (int)(x[1] * 1000),
+				(int)(x[2] * 1000), (int)(x[3] * 1000));
+		}
 	}
 
 	/* === Step 3: Final RMSNorm === */
@@ -469,6 +497,20 @@ static void forward_token_impl(struct hackbot_fpu_state *st,
 	/* === Step 4: Logits (tied embeddings) === */
 	matmul_fp16(logits_buf, xb, weights + st->embed_off,
 		    c->vocab_size, dim);
+
+	if (pos == 0) {
+		/* Find argmax for debug */
+		int best = 0;
+		for (d = 1; d < c->vocab_size; d++)
+			if (logits_buf[d] > logits_buf[best])
+				best = d;
+		pr_info("hackbot_fpu: logits[pos=0]: top1=token %d (logit=%d x1000), "
+			"logit[0]=%d, logit[1]=%d, logit[2]=%d (x1000)\n",
+			best, (int)(logits_buf[best] * 1000),
+			(int)(logits_buf[0] * 1000),
+			(int)(logits_buf[1] * 1000),
+			(int)(logits_buf[2] * 1000));
+	}
 }
 
 /* ===================================================================
@@ -645,29 +687,130 @@ int hackbot_fpu_forward(void *state, const void *weights,
 }
 
 /*
- * Get the argmax token from the logits buffer.
- * Returns the token ID with the highest logit.
+ * Sample the next token from the logits buffer using temperature + top-k.
+ *
+ * If HACKBOT_TEMPERATURE == 0: pure greedy (argmax).
+ * Otherwise: apply temperature scaling, find top-K candidates, compute
+ * softmax over them, and sample from the distribution.
+ *
+ * Returns the selected token ID.
  */
 int hackbot_fpu_get_next_token(const void *state)
 {
 	const struct hackbot_fpu_state *st = state;
-	int best = 0;
-	int i;
+	int result = 0;
 
 	if (!st || !st->logits)
 		return 0;
 
 	kernel_fpu_begin();
+
+#if HACKBOT_TEMPERATURE == 0
+	/* Pure greedy: argmax */
 	{
 		float best_val = st->logits[0];
+		int i;
+
 		for (i = 1; i < st->cfg.vocab_size; i++) {
 			if (st->logits[i] > best_val) {
 				best_val = st->logits[i];
-				best = i;
+				result = i;
 			}
 		}
 	}
+#else
+	{
+		const float temperature = (float)HACKBOT_TEMPERATURE / 100.0f;
+		const int top_k = (HACKBOT_TOP_K > 0 && HACKBOT_TOP_K < st->cfg.vocab_size)
+				  ? HACKBOT_TOP_K : st->cfg.vocab_size;
+		const int vocab_size = st->cfg.vocab_size;
+		const float *logits = st->logits;
+
+		/* Top-K candidates: (token_id, logit_value) */
+		int   top_ids[HACKBOT_TOP_K];
+		float top_vals[HACKBOT_TOP_K];
+		int   n_top = 0;
+		int   min_idx = 0;
+		int   i, j;
+		float max_val, sum_exp, cumul, r;
+		u32   rand_val;
+
+		/*
+		 * Step 1: Find top-K logits.
+		 * Maintain a min-heap-like array: scan all logits, keeping
+		 * the K largest values seen so far.
+		 */
+		for (i = 0; i < vocab_size; i++) {
+			if (n_top < top_k) {
+				/* Fill initial slots */
+				top_ids[n_top] = i;
+				top_vals[n_top] = logits[i];
+				if (n_top == 0 || logits[i] < top_vals[min_idx])
+					min_idx = n_top;
+				n_top++;
+			} else if (logits[i] > top_vals[min_idx]) {
+				/* Replace the current minimum */
+				top_ids[min_idx] = i;
+				top_vals[min_idx] = logits[i];
+				/* Find new minimum */
+				min_idx = 0;
+				for (j = 1; j < n_top; j++) {
+					if (top_vals[j] < top_vals[min_idx])
+						min_idx = j;
+				}
+			}
+		}
+
+		/*
+		 * Step 2: Apply temperature and compute softmax.
+		 * Scale logits by 1/temperature, subtract max for stability,
+		 * then exponentiate and normalize.
+		 */
+		max_val = top_vals[0];
+		for (i = 1; i < n_top; i++) {
+			if (top_vals[i] > max_val)
+				max_val = top_vals[i];
+		}
+
+		sum_exp = 0.0f;
+		for (i = 0; i < n_top; i++) {
+			top_vals[i] = expf_approx(
+				(top_vals[i] - max_val) / temperature);
+			sum_exp += top_vals[i];
+		}
+
+		/* Normalize to probabilities */
+		if (sum_exp > 0.0f) {
+			for (i = 0; i < n_top; i++)
+				top_vals[i] /= sum_exp;
+		} else {
+			/* Degenerate: uniform distribution */
+			for (i = 0; i < n_top; i++)
+				top_vals[i] = 1.0f / (float)n_top;
+		}
+
+		/*
+		 * Step 3: Sample from the distribution.
+		 * Generate a uniform random value in [0, 1) and walk the
+		 * cumulative distribution to find the selected token.
+		 */
+		rand_val = get_random_u32();
+		/* Convert to float in [0, 1) with 24-bit precision */
+		r = (float)(rand_val >> 8) / 16777216.0f;
+
+		cumul = 0.0f;
+		result = top_ids[0]; /* fallback */
+		for (i = 0; i < n_top; i++) {
+			cumul += top_vals[i];
+			if (r < cumul) {
+				result = top_ids[i];
+				break;
+			}
+		}
+	}
+#endif
+
 	kernel_fpu_end();
 
-	return best;
+	return result;
 }

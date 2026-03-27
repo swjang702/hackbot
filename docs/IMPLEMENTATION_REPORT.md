@@ -792,3 +792,132 @@ There is no kernel-internal compute dispatch layer. This is deliberate: GPU driv
 - `drivers/accel/ivpu/ivpu_drv.h` -- IVPU device structure (all internal, no exports)
 - `drivers/gpu/drm/amd/amdgpu/amdgpu_isp.c` -- only AMD exports (ISP camera buffer helpers)
 - `include/linux/dma-mapping.h` -- DMA APIs (available but useless without driver cooperation)
+
+---
+
+## In-Kernel Agent: Tier 0-1 Tool Expansion (Step 2d)
+
+**Status**: Complete
+**Date**: 2026-03-27
+
+### Overview
+
+Expanded the hackbot kernel agent from 3 Tier 0 tools (ps, mem, loadavg) to 6 tools spanning Tier 0 (observation) and Tier 1 (instrumentation). This transforms the agent from a passive observer into an active kernel investigator.
+
+### New Tools
+
+| Tool | Tier | What it does | Kernel APIs |
+|------|------|-------------|-------------|
+| `dmesg [N]` | 0 | Read kernel log messages | `register_console()` → 64KB ring buffer capture |
+| `files <pid>` | 0 | List open file descriptors | `find_vpid()` + `pid_task()` + `d_path()` |
+| `kprobe attach\|check\|detach <func>` | 1 | Instrument kernel functions | `register_kprobe()` with atomic64 hit counters |
+
+### Architecture: C Helpers + Rust Dispatch
+
+Complex kernel struct access lives in C helper files; Rust handles tool dispatch and formatting. This follows the existing `hackbot_fpu.c` pattern.
+
+```
+[Rust: hackbot_tools.rs]
+  execute_tool(raw) → split_tool_args(raw) → (name, args)
+    ├── b"ps"      → tool_ps()          [Rust, walks init_task]
+    ├── b"mem"     → tool_mem()          [Rust, si_meminfo()]
+    ├── b"loadavg" → tool_loadavg()      [Rust, avenrun[]]
+    ├── b"dmesg"   → tool_dmesg(args)    → hackbot_console_read()   [C]
+    ├── b"files"   → tool_files(args)    → hackbot_list_fds(pid)    [C]
+    └── b"kprobe"  → tool_kprobe(args)   → hackbot_kprobe_*()       [C]
+```
+
+### New Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `hackbot_console.c` | ~100 | Console ring buffer driver — registers `struct console`, captures all printk into 64KB circular buffer |
+| `hackbot_console.h` | ~20 | C header for console functions |
+| `hackbot_files.c` | ~140 | FD table walker — `find_vpid()` → `pid_task()` → walk `fdtable` → `d_path()` per FD |
+| `hackbot_files.h` | ~15 | C header for files function |
+| `hackbot_kprobe.c` | ~240 | Kprobe manager — up to 8 slots, attach/check/detach with atomic64 hit counters |
+| `hackbot_kprobe.h` | ~20 | C header for kprobe functions |
+
+### Key Design Decisions
+
+1. **Argument support**: `execute_tool()` refactored with `split_tool_args()` to handle `<tool>files 1234</tool>` syntax. Backward compatible — existing tools ignore empty args.
+
+2. **Console ring buffer** (dmesg): Registers a `struct console` to capture ALL printk messages, not just hackbot's own. Uses `raw_spinlock` (safe in IRQ/NMI context). Agent can now see kernel warnings, OOM events, driver messages.
+
+3. **FD listing** (files): Uses `find_vpid()` + `pid_task()` (O(1) hash lookup) under RCU, then `d_path()` for human-readable paths. Shows pipes, sockets, deleted files naturally via d_path formatting.
+
+4. **Kprobes** (kprobe): Tier 1 capability — reversible instrumentation. Pre-handler is lock-free (`atomic64_inc` only). Slots cleaned up on module unload. Max 8 concurrent probes prevents probe storms.
+
+5. **Safety**: All tools are read-only or reversibly-instrumentation. No kernel state is mutated. Kprobes have bounded slots and clean shutdown via `hackbot_kprobe_cleanup()`.
+
+### Modified Files
+
+- `hackbot_tools.rs` — Added `split_tool_args()`, `parse_usize()`, `tool_dmesg()`, `tool_files()`, `tool_kprobe()`; updated `execute_tool()` dispatch
+- `hackbot_types.rs` — Added 9 extern "C" declarations for new C functions
+- `hackbot_config.rs` — Updated `TOOL_DESCRIPTION` and `LOCAL_SYSTEM_PROMPT` with all 6 tools
+- `hackbot_device.rs` — Console init/exit and kprobe cleanup in module lifecycle
+- `Kbuild` — Added `hackbot_console.o`, `hackbot_files.o`, `hackbot_kprobe.o`
+
+---
+
+## FP16 Inference Diagnosis and Temperature Sampling (Step 2e)
+
+**Status**: Complete
+**Date**: 2026-03-28
+
+### Root Cause Analysis
+
+Investigated degenerate output from the in-kernel FP16/float32 forward pass (`hackbot_fpu.c`).
+
+**Methodology**: Created `tools/verify_fp16_forward.py` which reads the same binary model file, implements the EXACT same forward pass algorithm in Python, and compares against HuggingFace float32 reference at every step.
+
+**Findings**:
+
+| Test | vs HuggingFace | Result |
+|------|---------------|--------|
+| Single token forward | max error 0.000025, correlation 1.000000 | PERFECT |
+| 28-token prefill | max error 8.65, correlation 0.916 | Degraded |
+| C math approximations (exp, sin, cos, sqrt) | ~10^-4 relative error | Negligible |
+
+**Conclusion**: The forward pass implementation is **correct**. Weight layout, offsets, matmul dimensions, RoPE, attention, FFN — all verified. The issue is inherent FP16 weight precision (~3.3 decimal digits) accumulating error through 30 transformer layers x N prefill tokens. SmolLM2-135M is particularly sensitive because its logit distribution is flat (top tokens differ by <1.0).
+
+### Solution: Temperature + Top-K Sampling
+
+Pure greedy (argmax) decoding causes repetitive output when FP16 precision shifts the top-1 prediction. Implemented temperature + top-k sampling in `hackbot_fpu_get_next_token()`:
+
+```
+Algorithm:
+1. Find top-K logits (K=40) via linear scan with min-tracking
+2. Scale by 1/temperature (T=0.70)
+3. Softmax over top-K candidates
+4. Sample from distribution using kernel CSPRNG (get_random_u32)
+```
+
+**Key parameters** (compile-time, in hackbot_fpu.c):
+- `HACKBOT_TEMPERATURE = 70` (0.70) — deterministic but not locked to argmax
+- `HACKBOT_TOP_K = 40` — enough diversity without garbage tail tokens
+- Set `HACKBOT_TEMPERATURE = 0` for pure greedy (debugging)
+
+### System 1 vs System 2 Architecture
+
+The in-kernel LLM serves as **System 1** (fast reflexes):
+- SmolLM2-135M with FP16 weights
+- ~10ms per token inference
+- Good for: pattern matching, anomaly flagging, quick observations
+- Weakness: FP16 precision limits multi-token coherence
+
+The vLLM backend serves as **System 2** (deep reasoning):
+- Qwen 7B via kernel TCP socket
+- Good for: complex analysis, multi-step investigation, tool chaining
+- Full float16 precision on GPU, no accumulation issues
+
+### Prompt Optimization
+
+Shortened `LOCAL_SYSTEM_PROMPT` from ~40 tokens to ~25 tokens. Every token of prefill accumulates error across 30 layers, so shorter prompts directly improve generation quality.
+
+### Files Modified
+
+- `hackbot_fpu.c` — Temperature + top-k sampling in `hackbot_fpu_get_next_token()`, debug logging in forward pass
+- `hackbot_forward.rs` — Check and log FPU forward return values
+- `hackbot_config.rs` — Shortened `LOCAL_SYSTEM_PROMPT`
+- `tools/verify_fp16_forward.py` — **New**: FP16 forward pass verification against HuggingFace

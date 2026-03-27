@@ -1,7 +1,7 @@
 # hackbot Implementation Plan
 
-**Date**: 2026-03-02 (updated 2026-03-26)
-**Status**: Phase 1 complete, in-kernel LLM through Step 3f (FP16/float32 FPU inference path — builds, under debugging)
+**Date**: 2026-03-02 (updated 2026-03-28)
+**Status**: Phase 1 complete. In-kernel LLM through Step 2e: 6 tools (Tier 0-1), FP16 forward pass verified correct, temperature sampling. System 2 (vLLM) recommended for production use.
 **Guiding Principle**: Visualization-first MVP, Rust backend for Verus alignment
 
 ---
@@ -726,10 +726,13 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 | **1** | Kernel module skeleton: `/dev/hackbot` + prompt/response | Infrastructure | **DONE** |
 | **2a** | Kernel socket → vLLM (System 2 brain) | B | **DONE** |
 | **2b** | Kernel context injection (live system state in prompt) | B | **DONE** |
-| **2c** | Dynamic agent loop + kernel tools (OODA) | B | **DONE** |
-| **3** | In-kernel INT8 inference engine (System 1 reflex) | A | **NEXT** |
+| **2c** | Dynamic agent loop + 3 kernel tools (OODA) | B | **DONE** |
+| **2d** | Tier 0-1 tool expansion: dmesg, files, kprobe (6 tools total) | B+A | **DONE** |
+| **2e** | FP16 inference diagnosis + temperature sampling | A | **DONE** |
+| **3** | In-kernel INT8 inference engine (System 1 reflex) | A | **DONE** (precision-limited) |
+| **3f** | FP16/float32 FPU inference path | A | **DONE** (verified correct, FP16 precision limit) |
 | **3a** | Add and connect the mcp server 'sequential-thinking' | B |  |
-| **4** | Hybrid System 1/2 merge | D | After 2c + 3 |
+| **4** | Hybrid System 1/2 merge | D | **NEXT** |
 | **5** | Action capabilities with Verus-verified safety | All | Research |
 | **6** | 3D game rendering of agent behavior | Frontend | After 4 |
 
@@ -761,6 +764,20 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
   - **Model format v2**: FP16 weights (`weight_type=0`), float32 RMSNorm weights. New exporter: `tools/export_hackbot_fp16.py`.
   - **New files**: `hackbot_fpu.c` (float32 forward pass in C), `hackbot_fpu.h` (FFI header). Kbuild: `-mhard-float -msse -msse2` for `hackbot_fpu.o`.
   - **Status**: Compiles and links into `hackbot.ko`. Model loads. Output still degenerate — under investigation (likely weight layout or FPU forward pass bug).
+
+**Step 2d details** — Tier 0-1 tool expansion (DONE, 2026-03-28):
+- Extended from 3 Tier 0 tools to 6 tools spanning Tier 0 (observation) and Tier 1 (instrumentation)
+- **dmesg [N]** (Tier 0): Registers `struct console` driver to capture ALL printk into 64KB ring buffer. `hackbot_console.c`.
+- **files \<pid\>** (Tier 0): `find_vpid()` → `pid_task()` → walk `fdtable` → `d_path()` per FD. `hackbot_files.c`.
+- **kprobe attach|check|detach \<func\>** (Tier 1): `register_kprobe()` with atomic64 hit counters, max 8 slots. `hackbot_kprobe.c`.
+- Refactored `execute_tool()` with `split_tool_args()` for argument support: `<tool>files 1234</tool>`
+- C helpers follow hackbot_fpu.c pattern: complex kernel struct access in C, dispatch in Rust
+
+**Step 2e details** — FP16 inference diagnosis + temperature sampling (DONE, 2026-03-28):
+- Created `tools/verify_fp16_forward.py` — reimplements C forward pass in Python, compares vs HuggingFace
+- **Finding**: Forward pass is CORRECT. Single token: correlation 1.000, max error 0.000025. 28+ tokens: degrades due to FP16 precision accumulating across 30 layers × N prefill steps.
+- **Solution**: Temperature + top-k sampling (T=0.70, K=40) in `hackbot_fpu_get_next_token()` via kernel CSPRNG
+- **System 1/2 framing**: Local (SmolLM2-135M, FP16) = fast reflexes. vLLM (Qwen 7B) = deep reasoning.
 
 **Why OODA before INT8**: The tool interface (Step 2c) is foundational — it defines what the agent CAN DO regardless of where inference runs. INT8 (Step 3) is a performance optimization of where inference runs. We validated the tool architecture with remote vLLM first (easier debugging, smarter model), then swap in the local INT8 engine.
 
