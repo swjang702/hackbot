@@ -1,7 +1,9 @@
 - in-kernel llm (ebpf 가 kernel verifier 처럼.?) (커널 trace data로 학습?? 경량 로컬 llm을 보완하는 방법? 커널의 동작 데이터가 엄청 많잖아.?!) (in kernel llm 이 보는것만 하면 그래도 괜찮은데 action이(손발) 주어지면 엄청 위험하지?! 그래서 formal verification?? 만약 이게 된다?? 그럼 os의 새로운 generation 아닐까?!) (observability and transparency)
-- alphafold(AlphaFold is an AI system developed by Google DeepMind that predicts a protein’s 3D structure from its amino acid sequence.)를 활용해볼 순 없을까? 이걸 이렇게 문자을 적어보면..? (predicts a kernel's 3D structure from its traced sequence.) (kernel에서 protein에 해당하는게 뭘까..? 이게 the art of modeling(mapping)?) / tracing sequence로 뭔가 학습해서 예측에 쓰일 수 있지 않을까.? / llm 이랑 fuzzing 이랑 뭐가 다른거지.?!.? syscall sequence 만드는 건 같다.?!.!!
+- alphafold(AlphaFold is an AI system developed by Google DeepMind that predicts a protein’s 3D structure from its amino acid sequence.)를 활용해볼 순 없을까? 이걸 이렇게 문자을 적어보면..? (predicts a kernel's 3D structure from its traced sequence.) (kernel에서 protein에 해당하는게 뭘까..? 이게 the art of modeling(mapping)?) / llm 이랑 fuzzing 이랑 뭐가 다른거지.?!.? syscall sequence 만드는 건 같다.?!.!!
+- trace subsystem을 오감 으로..?!? tracepoint를 ftrace에서 on 하는 것처럼, hackbot에서 바로 access해서 그 지점들 데이터를 볼 수 있게끔..?!? 이게 되면 bpf 도 되지 않을까?? trace system을 in kernel llm의 눈과 귀로 달아주는 ; ebpf verifier 에 들어오는 것들 다 학습 or 추론?! / tracing sequence로 뭔가 학습해서 예측에 쓰일 수 있지 않을까.?
 - grafeo graph db ? in hackbot?
-- trace subsystem을 오감 으로..?!? tracepoint를 ftrace에서 on 하는 것처럼, hackbot에서 바로 access해서 그 지점들 데이터를 볼 수 있게끔..?!? 이게 되면 bpf 도 되지 않을까?? trace system을 in kernel llm의 눈과 귀로 달아주는 ; ebpf verifier 에 들어오는 것들 다 학습 or 추론?!
+- Synthesize [Hyperagents](https://github.com/facebookresearch/HyperAgents) : https://arxiv.org/pdf/2603.19461
+- Refer to [LinnOS](https://www.usenix.org/system/files/osdi20-hao.pdf)
 
 
 # Mathematical thoughts
@@ -70,7 +72,10 @@ if you have any concerns, please let me know.
   I'm not sure. how do you think?? and what's the remained steps??
 
 
-
-
-
+/task_easy I'd like to synthesize these ideas hyperagents(@docs/refs/\[26\ Meta\]\ HyperAgents.pdf), LinnOS(@docs/refs/\[20\ OSDI\]\ LinnOS-\ Predictability\ on\ Unpredictable\ Flash\ Storage\ with\ a\ Light\ Neural\ Network.pdf), and my thoughts:
+```
+- trace subsystem을 오감 으로..?!? tracepoint를 ftrace에서 on 하는 것처럼, hackbot에서 바로 access해서 그 지점들 데이터를 볼 수 있게끔..?!? 이게 되면 bpf 도 되지 않을까?? trace system을 in kernel llm의 눈과 귀로 달아주는 ; ebpf verifier 에 들어오는 것들 다 학습 or 추론?! / tracing sequence로 뭔가 학습해서 예측에 쓰일 수 있지 않을까.?
+- in-kernel llm (ebpf 가 kernel verifier 처럼.?) (커널 trace data로 학습?? 경량 로컬 llm을 보완하는 방법? 커널의 동작 데이터가 엄청 많잖아.?!) (in kernel llm 이 보는것만 하면 그래도 괜찮은데 action이(손발) 주어지면 엄청 위험하지?! 그래서 formal verification?? 만약 이게 된다?? 그럼 os의 새로운 generation 아닐까?!) (observability and transparency)
+```
+Before we get started something, I wonder which way is the best for you to understand these docs and leverage in your work.? e.g., using chroma or, just reading files and write the sum up in the file and refer to it as working, and so on. which way to understand and refer to docs can be the best do to your work efficiently?
 

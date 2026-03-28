@@ -101,6 +101,12 @@ pub(crate) fn record_finding(source: &[u8], text: &[u8]) {
 
     guard.head = (idx + 1) % MEMORY_MAX_ENTRIES;
     guard.total_recorded += 1;
+    let total = guard.total_recorded;
+    drop(guard);
+
+    let src = core::str::from_utf8(source).unwrap_or("?");
+    pr_info!("hackbot: memory: recorded finding #{} from '{}' ({} bytes)\n",
+             total, src, txt_len);
 }
 
 /// Format the agent memory for injection into the vLLM system prompt.
@@ -127,8 +133,11 @@ pub(crate) fn format_memory_for_prompt(buf: &mut KVVec<u8>) {
     }
 
     if count == 0 {
+        pr_info!("hackbot: memory: no findings to inject into prompt\n");
         return;
     }
+
+    pr_info!("hackbot: memory: injecting {} findings into system prompt\n", count);
 
     let mut num = [0u8; 20];
 
