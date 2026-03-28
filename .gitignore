@@ -24,3 +24,12 @@ linux-6.19.8/
 
 # Python cache
 __pycache__/
+
+# Research PDFs (too large for git, keep locally)
+docs/refs/*.pdf
+
+# External repos
+HyperAgents/
+
+# Scratch files
+plan-mode.md
