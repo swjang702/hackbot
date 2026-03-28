@@ -164,6 +164,13 @@ extern "C" {
     pub(crate) fn hackbot_kprobe_detach(symbol: *const u8, len: i32) -> i32;
     /// Unregister all active kprobes (called on module unload).
     pub(crate) fn hackbot_kprobe_cleanup();
+
+    // --- hackbot_patrol.c: autonomous patrol kthread ---
+
+    /// Start the patrol kthread. Returns 0 on success, -errno on failure.
+    pub(crate) fn hackbot_patrol_start() -> i32;
+    /// Stop the patrol kthread and wait for exit.
+    pub(crate) fn hackbot_patrol_stop();
 }
 
 // Compile-time check: avenrun declaration assumes 64-bit unsigned long.

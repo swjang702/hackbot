@@ -34,6 +34,7 @@ impl kernel::InPlaceModule for HackbotModule {
         // SAFETY: Called exactly once during module load.
         unsafe { RESPONSE.init() };
         unsafe { MODEL.init() };
+        crate::memory::init_memory();
 
         pr_info!("hackbot: loading module, creating /dev/hackbot\n");
 
@@ -49,6 +50,14 @@ impl kernel::InPlaceModule for HackbotModule {
             VLLM_PORT,
         );
 
+        // Start the autonomous patrol kthread.
+        // Non-fatal: module works without patrol if vLLM is unreachable.
+        let patrol_ret = unsafe { crate::types::hackbot_patrol_start() };
+        if patrol_ret < 0 {
+            pr_warn!("hackbot: patrol thread failed to start ({}), continuing without patrol\n",
+                     patrol_ret);
+        }
+
         let options = MiscDeviceOptions {
             name: c_str!("hackbot"),
         };
@@ -62,6 +71,8 @@ impl kernel::InPlaceModule for HackbotModule {
 #[pinned_drop]
 impl PinnedDrop for HackbotModule {
     fn drop(self: Pin<&mut Self>) {
+        // Stop patrol thread FIRST — it may be using vLLM/tools/model.
+        unsafe { crate::types::hackbot_patrol_stop() };
         // Clean up kprobes before unloading.
         unsafe { crate::types::hackbot_kprobe_cleanup() };
         free_model_resources();

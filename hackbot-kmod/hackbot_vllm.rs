@@ -222,6 +222,7 @@ fn agent_loop_vllm(prompt: &[u8]) -> Result<KVVec<u8>> {
     let mut system_content = KVVec::new();
     let _ = system_content.extend_from_slice(SYSTEM_IDENTITY, GFP_KERNEL);
     let _ = system_content.extend_from_slice(&kernel_ctx, GFP_KERNEL);
+    crate::memory::format_memory_for_prompt(&mut system_content);
     let _ = system_content.extend_from_slice(TOOL_DESCRIPTION, GFP_KERNEL);
 
     let mut messages = KVVec::new();
@@ -326,6 +327,11 @@ Analyze it thoughtfully and respond to the user.",
             b"\n[hackbot] Agent stopped after maximum iterations.\n",
             GFP_KERNEL,
         );
+    }
+
+    // Record this interaction in agent memory for future context.
+    if got_final_answer && !final_answer.is_empty() {
+        crate::memory::record_finding(crate::config::SOURCE_USER, &final_answer);
     }
 
     Ok(final_answer)

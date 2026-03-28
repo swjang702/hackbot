@@ -66,5 +66,8 @@ mod agent;
 #[path = "hackbot_vllm.rs"]
 mod vllm;
 
+#[path = "hackbot_memory.rs"]
+mod memory;
+
 #[path = "hackbot_device.rs"]
 mod device;

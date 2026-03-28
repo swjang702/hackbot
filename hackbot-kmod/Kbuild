@@ -2,7 +2,7 @@
 
 # Mixed C + Rust module: hackbot_main.rs (Rust) + C helpers
 obj-m := hackbot.o
-hackbot-y := hackbot_main.o hackbot_fpu.o hackbot_console.o hackbot_files.o hackbot_kprobe.o
+hackbot-y := hackbot_main.o hackbot_fpu.o hackbot_console.o hackbot_files.o hackbot_kprobe.o hackbot_patrol.o
 
 # Enable hardware FPU/SSE for the FPU helper — kernel builds with -msoft-float
 # by default. kernel_fpu_begin()/end() in hackbot_fpu.c save/restore FPU state
