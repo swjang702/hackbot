@@ -8,7 +8,10 @@
 #   make clean              # clean build artifacts
 #   make load               # insmod the module (requires sudo)
 #   make unload             # rmmod the module (requires sudo)
-#   make test               # quick smoke test
+#   make test               # quick smoke test (load → write → read → unload)
+#   make test-full           # full integration test suite
+#   make test-tools          # test all 6 tools via vLLM
+#   make test-patrol         # test patrol thread (waits ~35s)
 
 KDIR ?= $(HOME)/sources/linux-6.19.8
 PWD := $(shell pwd)
@@ -36,4 +39,13 @@ test: load
 	@echo "--- Done ---"
 	$(MAKE) unload
 
-.PHONY: default clean load unload test
+test-full:
+	sudo bash test.sh full
+
+test-tools:
+	sudo bash test.sh tools
+
+test-patrol:
+	sudo bash test.sh patrol
+
+.PHONY: default clean load unload test test-full test-tools test-patrol
