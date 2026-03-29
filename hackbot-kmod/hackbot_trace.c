@@ -285,14 +285,19 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 	blk_status_t error, unsigned int nr_bytes)
 {
 	struct hackbot_trace_state *s = data;
-	u64 now = ktime_get_raw_fast_ns();
+	u64 now = ktime_get_ns();  /* Must match block layer's clock (not raw) */
 	int idx;
 	unsigned long flags;
 	u32 latency_us;
 	int bucket;
 
-	/* Compute I/O latency from request start time */
-	latency_us = (u32)((now - rq->start_time_ns) / 1000);
+	/* Compute I/O latency from request start time.
+	 * rq->start_time_ns uses ktime_get_ns() (adjusted monotonic),
+	 * so we must use the same clock here — NOT ktime_get_raw_fast_ns(). */
+	if (now > rq->start_time_ns)
+		latency_us = (u32)((now - rq->start_time_ns) / 1000);
+	else
+		latency_us = 0;  /* clock skew guard */
 
 	/* Tier 1: Raw ring */
 	idx = atomic_inc_return(&s->io_ring_head) % RAW_RING_SIZE;

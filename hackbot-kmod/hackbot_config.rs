@@ -23,13 +23,21 @@ pub(crate) const IPPROTO_TCP: i32 = 6;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of agent loop iterations (tool calls).
-pub(crate) const MAX_AGENT_ITERATIONS: usize = 10;
+/// Reduced from 10 to 5 to fit within the vLLM model's 6976-token context limit.
+/// Each tool call adds ~500-1000 tokens to the conversation.
+pub(crate) const MAX_AGENT_ITERATIONS: usize = 5;
 /// Maximum number of processes to list in the `ps` tool output.
 pub(crate) const MAX_PS_TASKS: usize = 512;
 /// Maximum size for a single tool output (8 KB).
-pub(crate) const MAX_TOOL_OUTPUT: usize = 8 * 1024;
+/// Per-tool output limit. Reduced from 8KB to 4KB to fit more tool calls
+/// within the vLLM model's context window (6976 tokens ≈ ~5200 bytes of text).
+pub(crate) const MAX_TOOL_OUTPUT: usize = 4 * 1024;
 /// Maximum conversation size sent to vLLM (96 KB).
 pub(crate) const MAX_CONVERSATION_SIZE: usize = 96 * 1024;
+/// Maximum output tokens requested from vLLM per call.
+/// Must fit within the model's context window minus prompt tokens.
+/// Qwen2.5-7B-AWQ has 6976 tokens total; prompt uses ~2000-5000 tokens.
+pub(crate) const VLLM_MAX_TOKENS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // System prompts
@@ -41,35 +49,12 @@ You exist as a kernel module with direct access to hardware and kernel data stru
 Think deeply. Reason carefully. Share your insights and analysis freely. \
 You are a thinking agent, not just a tool dispatcher.\n\n";
 
-/// Tool description — permissive guidance, not restrictive rules.
-pub(crate) const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- when you need live kernel data, output the exact XML tag:\n\n\
-  Tier 0 (observation):\n\
-  <tool>ps</tool>                      - list running processes (PID, PPID, state, command)\n\
-  <tool>mem</tool>                     - detailed memory statistics\n\
-  <tool>loadavg</tool>                 - system load averages and uptime\n\
-  <tool>dmesg</tool>                   - recent kernel log messages\n\
-  <tool>dmesg 20</tool>               - last 20 lines of kernel log\n\
-  <tool>files PID</tool>              - list open file descriptors (e.g. <tool>files 1</tool>)\n\n\
-  Tier 1 (instrumentation):\n\
-  <tool>kprobe attach FUNC</tool>     - attach kprobe to kernel function (e.g. <tool>kprobe attach do_sys_openat2</tool>)\n\
-  <tool>kprobe check</tool>           - show active kprobes with hit counts\n\
-  <tool>kprobe detach FUNC</tool>     - remove a kprobe\n\n\
-  Always-on sensing (continuous tracepoints):\n\
-  <tool>trace sched</tool>            - scheduler context switches (summary + features)\n\
-  <tool>trace sched raw 20</tool>     - last 20 raw sched_switch events\n\
-  <tool>trace syscall</tool>          - syscall patterns and frequency\n\
-  <tool>trace io</tool>               - I/O latency histogram and LinnOS features\n\
-  <tool>trace reset</tool>            - zero counters for fresh measurement window\n\n\
-HOW TO USE:\n\
-- To call a tool, include <tool>name</tool> in your response\n\
-- You will receive the real output, then can analyze and discuss it\n\
-- Use tools when the user asks about current system state\n\
-- For reasoning, analysis, or discussion -- think and respond directly\n\
-- You may reason before calling a tool\n\
-- Kprobes persist across tool calls. Attach, do other work, then check hit counts later.\n\n\
-IMPORTANT: Never fabricate system data (PIDs, memory numbers, load values). \
-Use tools to get real data when needed. But feel free to reason, analyze, \
-and share your thoughts on any topic.\n";
+/// Tool description — compact to fit within vLLM context limits.
+pub(crate) const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- output <tool>name</tool> to get live kernel data:\n\
+  <tool>ps</tool> <tool>mem</tool> <tool>loadavg</tool> <tool>dmesg</tool> <tool>files PID</tool>\n\
+  <tool>kprobe attach FUNC</tool> <tool>kprobe check</tool> <tool>kprobe detach FUNC</tool>\n\
+  <tool>trace sched</tool> <tool>trace syscall</tool> <tool>trace io</tool> <tool>trace sched raw N</tool>\n\
+Never fabricate data. Use tools for real data. Be concise in your analysis.\n";
 
 // ---------------------------------------------------------------------------
 // Model format constants

@@ -90,3 +90,12 @@ How's your thought??
 (FYI, For sensory system, even if there are already some ebpf tracer, what about directly accesss kerne trace systems and ebpf systems from in-kernel hackbot)
 
 
+/task_easy I'd like to manage configuration of LLM seperately. e.g., system prompt, max_token, # of iterations, tool docs, etc. in a conf file. Thus, it'd be easier to check out and modify. how do you think??
+
+
+/task_easy Ultra think that I'd like to use tracing data as learning data. Here's some topics to discussioin.
+1. What does learning exactly mean?
+2. Exactly Who learn these sensory data?
+3. After learning, What can be done by hackbot?
+Please refer to docs and conversation notes.
+

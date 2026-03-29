@@ -65,6 +65,8 @@ pub(crate) fn process_prompt(prompt: &[u8]) -> KVVec<u8> {
         return r;
     }
 
+    pr_info!("hackbot: [user] query received ({} bytes)\n", prompt_trimmed.len());
+
     match agent_loop(prompt_trimmed) {
         Ok(mut text) => {
             if text.last() != Some(&b'\n') {
@@ -188,8 +190,11 @@ fn build_vllm_request(model_name: &[u8], messages_json: &[u8]) -> Result<KVVec<u
     json_escape(model_name, &mut body);
     let _ = body.extend_from_slice(b"\",\"messages\":", GFP_KERNEL);
     let _ = body.extend_from_slice(messages_json, GFP_KERNEL);
+    let _ = body.extend_from_slice(b",\"max_tokens\":", GFP_KERNEL);
+    let mut num_buf = [0u8; 20];
+    let _ = body.extend_from_slice(format_usize(VLLM_MAX_TOKENS, &mut num_buf), GFP_KERNEL);
     let _ = body.extend_from_slice(
-        b",\"max_tokens\":4096,\"temperature\":0.7,\"repetition_penalty\":1.1,\"stop\":[\"</tool>\"]}",
+        b",\"temperature\":0.7,\"repetition_penalty\":1.1,\"stop\":[\"</tool>\"]}",
         GFP_KERNEL,
     );
 
