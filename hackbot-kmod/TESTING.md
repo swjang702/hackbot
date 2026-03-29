@@ -29,7 +29,7 @@ This loads the module, writes "hello from userspace" to `/dev/hackbot`, reads th
 ```bash
 sudo bash test.sh full       # All tests (~10 min, waits for patrol)
 sudo bash test.sh quick      # Load/unload + basic I/O only (~2 min)
-sudo bash test.sh tools      # All 6 tools via vLLM (~5 min)
+sudo bash test.sh tools      # All 7 tools via vLLM (~5 min)
 sudo bash test.sh patrol     # Patrol thread test (~40s)
 sudo bash test.sh memory     # Agent memory persistence (~3 min)
 ```
@@ -54,6 +54,10 @@ dmesg | grep hackbot
 # Expected:
 #   hackbot: loading module, creating /dev/hackbot
 #   hackbot: vLLM endpoint = 100.66.136.70:8000
+#   hackbot: trace: sched_switch registered
+#   hackbot: trace: sys_enter registered
+#   hackbot: trace: block_rq_complete registered
+#   hackbot: trace: sensory layer initialized (sched syscall io)
 #   hackbot: patrol thread created (pid XXXX)
 #   hackbot: patrol thread started (interval=120s)
 
@@ -85,7 +89,7 @@ echo "hello" > /dev/hackbot && cat /dev/hackbot
 echo "what processes are running on this system?" > /dev/hackbot && cat /dev/hackbot
 ```
 
-### 3. Testing All 6 Tools
+### 3. Testing All 7 Tools
 
 Each tool is triggered by the LLM when it decides it needs data. The prompts below are designed to encourage the agent to use specific tools.
 
@@ -107,6 +111,9 @@ echo "what files does PID 1 (systemd) have open? use the files tool" > /dev/hack
 
 # Tool: kprobe — kernel function instrumentation
 echo "attach a kprobe to do_sys_openat2, wait a moment, then check the hit count" > /dev/hackbot && cat /dev/hackbot
+
+# Tool: trace — continuous tracepoint sensing (see Section 8 below for detailed tests)
+echo "use the trace sched tool to check scheduler activity" > /dev/hackbot && cat /dev/hackbot
 ```
 
 After each query, you can check dmesg for tool call details:
@@ -116,7 +123,7 @@ dmesg | tail -30 | grep hackbot
 # Look for:
 #   hackbot: agent iteration 1/10
 #   hackbot: tool call 'ps' at iteration 1
-#   hackbot: tool call 'kprobe attach do_sys_openat2' at iteration 2
+#   hackbot: tool call 'trace sched' at iteration 2
 #   hackbot: final answer at iteration 3
 ```
 
@@ -227,6 +234,144 @@ dmesg | grep "hackbot: patrol"
 #   hackbot: patrol cycle failed: error -111   (ECONNREFUSED)
 ```
 
+### 8. Testing Continuous Trace Sensing (Layer 0)
+
+Tracepoints are always-on — registered at module load, continuously accumulating data. The `trace` tool reads from them at any time.
+
+#### 8a. Verify Tracepoints Registered
+
+```bash
+sudo insmod hackbot.ko
+
+# Check that all three tracepoints registered
+dmesg | grep "hackbot: trace:"
+# Expected:
+#   hackbot: trace: sched_switch registered
+#   hackbot: trace: sys_enter registered
+#   hackbot: trace: block_rq_complete registered  (or "not found" if no block devices)
+#   hackbot: trace: sensory layer initialized (sched syscall io)
+```
+
+#### 8b. Direct Tool Invocation (No LLM)
+
+These bypass the LLM and invoke tools directly — useful for verifying the trace data structures work:
+
+```bash
+# Scheduler summary — context switches + LinnOS-style features
+echo "trace sched" > /dev/hackbot && cat /dev/hackbot
+# Expected: event count, rate, top tasks, feature vector intervals
+
+# Raw scheduler events — actual context switches happening right now
+echo "trace sched raw 20" > /dev/hackbot && cat /dev/hackbot
+# Expected: 20 lines like: [+2m:15.847] CPU2: bash(1234) -> httpd(5678)
+
+# Syscall patterns — which syscalls are most frequent
+echo "trace syscall" > /dev/hackbot && cat /dev/hackbot
+# Expected: total count, per-syscall breakdown, feature vector
+
+# Raw syscall events — individual syscall entries
+echo "trace syscall raw 10" > /dev/hackbot && cat /dev/hackbot
+# Expected: 10 lines like: CPU0 bash(1234): syscall 0
+
+# I/O latency + histogram (requires active block devices)
+echo "trace io" > /dev/hackbot && cat /dev/hackbot
+# Expected: total I/Os, avg latency, histogram buckets, LinnOS features
+
+# Raw I/O events
+echo "trace io raw 10" > /dev/hackbot && cat /dev/hackbot
+# Expected: READ/WRITE entries with sector, bytes
+
+# Reset counters for fresh measurement window
+echo "trace reset" > /dev/hackbot && cat /dev/hackbot
+# Expected: "Trace counters reset. Tracepoints still active."
+
+# Wait 5 seconds, then check — should show ~5s of activity
+sleep 5
+echo "trace sched" > /dev/hackbot && cat /dev/hackbot
+
+# List active tracepoints
+echo "trace list" > /dev/hackbot && cat /dev/hackbot
+```
+
+#### 8c. LLM-Driven Investigation (Requires vLLM)
+
+Let the agent decide how to use trace data for investigation:
+
+```bash
+# Cross-subsystem analysis (the KILLER demo!)
+echo "use trace tools to analyze what this system is doing right now — check scheduler, syscalls, and I/O patterns" > /dev/hackbot && cat /dev/hackbot
+
+# Specific scheduler investigation
+echo "show me the raw scheduler events — who is context switching the most?" > /dev/hackbot && cat /dev/hackbot
+
+# Combined investigation — trace + ps + mem together
+echo "do a full system health check: check processes, memory, and trace sensor data" > /dev/hackbot && cat /dev/hackbot
+
+# I/O investigation
+echo "are there any slow I/Os? check the trace io data and latency histogram" > /dev/hackbot && cat /dev/hackbot
+
+# Feature-focused query (LinnOS-style)
+echo "look at the trace features — are the recent scheduler intervals and I/O latencies normal?" > /dev/hackbot && cat /dev/hackbot
+```
+
+#### 8d. Generate Load Then Investigate
+
+Generate activity in one terminal, then ask hackbot to investigate in another:
+
+```bash
+# Terminal 1: Generate CPU load
+stress-ng --cpu 4 --timeout 15s
+
+# Terminal 2: While load is running, ask hackbot
+echo "the system seems busy — use trace sched and trace syscall to investigate why" > /dev/hackbot && cat /dev/hackbot
+```
+
+```bash
+# Terminal 1: Generate I/O load
+dd if=/dev/zero of=/tmp/testfile bs=1M count=100 conv=fdatasync
+
+# Terminal 2: Ask hackbot about I/O
+echo "check trace io for any slow I/O operations" > /dev/hackbot && cat /dev/hackbot
+```
+
+```bash
+# Terminal 1: Generate syscall load
+find / -maxdepth 3 -name "*.conf" 2>/dev/null
+
+# Terminal 2: Check syscall patterns
+echo "trace syscall" > /dev/hackbot && cat /dev/hackbot
+# Should show openat, getdents64, stat as top syscalls
+```
+
+#### 8e. Verify Clean Shutdown
+
+```bash
+sudo rmmod hackbot
+
+# Verify tracepoints were unregistered
+dmesg | grep "hackbot: trace:"
+# Expected:
+#   hackbot: trace: sensory layer shutdown
+
+# Verify no leaked tracepoint registrations
+# (if tracing system is healthy, no warnings in dmesg)
+dmesg | tail -5 | grep -i "warn\|error\|bug"
+# Expected: nothing
+```
+
+#### 8f. Trace Data Summary
+
+| Subsystem | Tracepoint | Data Collected | What It Reveals |
+|-----------|-----------|----------------|-----------------|
+| Scheduler | `sched_switch` | Context switches per task, switch intervals, runqueue depth | Who's running, how often, scheduling health |
+| Syscalls | `sys_enter` | Syscall frequency, per-ID counts, call sequences | What the workload is doing, I/O vs compute ratio |
+| Storage | `block_rq_complete` | I/O latency histogram, completion rates, LinnOS features | Storage health, slow I/O detection, tail latency |
+
+Each tracepoint maintains three data tiers:
+- **Raw ring buffer**: Last 1024 events with timestamps (for detailed investigation)
+- **Feature vector**: Sliding window of last 4 values (for future LinnOS-style classifiers)
+- **Aggregates**: Total counts, per-task/per-syscall breakdowns, histograms (for summaries)
+
 ---
 
 ## Understanding dmesg Output
@@ -253,6 +398,12 @@ All hackbot kernel messages are prefixed with `hackbot:`. Key message categories
 | `hackbot: kprobe attached to 'FUNC'` | Kprobe registered |
 | `hackbot: kprobe detached from 'FUNC'` | Kprobe unregistered |
 | `hackbot: cleanup kprobe 'FUNC'` | Kprobe cleaned up during unload |
+| `hackbot: trace: sched_switch registered` | Scheduler tracepoint callback active |
+| `hackbot: trace: sys_enter registered` | Syscall tracepoint callback active |
+| `hackbot: trace: block_rq_complete registered` | I/O tracepoint callback active |
+| `hackbot: trace: sensory layer initialized (...)` | All tracepoints registered, sensing active |
+| `hackbot: trace: sensory layer shutdown` | All tracepoints unregistered on unload |
+| `hackbot: trace: ... not found` | Tracepoint not available (e.g., no block devices) |
 | `hackbot: unloading module` | Module removed cleanly |
 
 ---
@@ -296,6 +447,30 @@ make load           # sudo insmod hackbot.ko
 make unload         # sudo rmmod hackbot
 make test           # Quick smoke test (load → write → read → unload)
 make test-full      # Full test suite (all categories)
-make test-tools     # Test all 6 tools
+make test-tools     # Test all 7 tools
 make test-patrol    # Test patrol thread
+```
+
+---
+
+## Architecture: 7 Tools + 3 Continuous Sensors
+
+```
+/dev/hackbot
+    │
+    ├── Tier 0 Tools (observation):
+    │   ps, mem, loadavg, dmesg, files
+    │
+    ├── Tier 1 Tools (instrumentation):
+    │   kprobe attach|check|detach
+    │
+    └── Always-On Sensors (continuous tracepoints):
+        trace sched    → sched_switch (context switches)
+        trace syscall  → sys_enter (syscall patterns)
+        trace io       → block_rq_complete (I/O latency)
+        │
+        Each sensor maintains:
+        ├── Raw ring buffer (last 1024 events)
+        ├── Feature vector (LinnOS-style, for future classifiers)
+        └── Aggregate stats (counters, histograms)
 ```

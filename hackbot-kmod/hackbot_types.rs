@@ -171,6 +171,27 @@ extern "C" {
     pub(crate) fn hackbot_patrol_start() -> i32;
     /// Stop the patrol kthread and wait for exit.
     pub(crate) fn hackbot_patrol_stop();
+
+    // --- hackbot_trace.c: continuous tracepoint sensing (Layer 0) ---
+
+    /// Initialize tracepoint sensing. Registers sched_switch, sys_enter, block_rq_complete.
+    pub(crate) fn hackbot_trace_init() -> i32;
+    /// Shutdown tracepoint sensing. Unregisters all callbacks.
+    pub(crate) fn hackbot_trace_exit();
+    /// Read scheduler trace summary. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_sched(out: *mut u8, maxlen: i32) -> i32;
+    /// Read syscall trace summary. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_syscall(out: *mut u8, maxlen: i32) -> i32;
+    /// Read I/O trace summary. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_io(out: *mut u8, maxlen: i32) -> i32;
+    /// Read raw scheduler events. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_sched_raw(out: *mut u8, maxlen: i32, count: i32) -> i32;
+    /// Read raw syscall events. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_syscall_raw(out: *mut u8, maxlen: i32, count: i32) -> i32;
+    /// Read raw I/O events. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_io_raw(out: *mut u8, maxlen: i32, count: i32) -> i32;
+    /// Reset "since last reset" counters.
+    pub(crate) fn hackbot_trace_reset();
 }
 
 // Compile-time check: avenrun declaration assumes 64-bit unsigned long.

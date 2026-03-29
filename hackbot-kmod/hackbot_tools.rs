@@ -86,11 +86,12 @@ pub(crate) fn execute_tool(raw: &[u8]) -> KVVec<u8> {
         b"dmesg" => tool_dmesg(&mut output, args),
         b"files" => tool_files(&mut output, args),
         b"kprobe" => tool_kprobe(&mut output, args),
+        b"trace" => tool_trace(&mut output, args),
         _ => {
             let _ = output.extend_from_slice(b"[Error: unknown tool '", GFP_KERNEL);
             let _ = output.extend_from_slice(name, GFP_KERNEL);
             let _ = output.extend_from_slice(
-                b"'. Available tools: ps, mem, loadavg, dmesg, files, kprobe]\n",
+                b"'. Available tools: ps, mem, loadavg, dmesg, files, kprobe, trace]\n",
                 GFP_KERNEL,
             );
         }
@@ -536,6 +537,110 @@ fn tool_kprobe(output: &mut KVVec<u8>, args: &[u8]) {
                   \x20 <tool>kprobe check</tool>         - show active kprobes and hit counts\n\
                   \x20 <tool>kprobe detach FUNC</tool>  - remove kprobe from function\n\n\
                   Example: <tool>kprobe attach do_sys_openat2</tool>\n",
+                GFP_KERNEL,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 0: trace — continuous kernel tracepoint sensing
+// ---------------------------------------------------------------------------
+
+/// Tool: `trace <subsystem> [raw N]` — read from always-on tracepoint sensors.
+///
+/// Subsystems: `sched`, `syscall`, `io`
+/// Options:
+///   - `trace sched`        — aggregate summary + features + notable events
+///   - `trace sched raw 20` — last 20 raw sched_switch events
+///   - `trace syscall`      — syscall aggregate + features
+///   - `trace io`           — I/O stats + latency histogram + LinnOS features
+///   - `trace reset`        — zero "since last reset" counters
+///   - `trace list`         — show active tracepoints
+fn tool_trace(output: &mut KVVec<u8>, args: &[u8]) {
+    let (subcmd, subargs) = split_tool_args(args);
+
+    let buf_size: usize = MAX_TOOL_OUTPUT - 256;
+    let mut buf = KVVec::new();
+    if buf.resize(buf_size, 0, GFP_KERNEL).is_err() {
+        let _ = output.extend_from_slice(b"[Error: alloc failed]\n", GFP_KERNEL);
+        return;
+    }
+
+    match subcmd {
+        b"sched" => {
+            let (maybe_raw, count_str) = split_tool_args(subargs);
+            let n = if maybe_raw == b"raw" {
+                let count = if !count_str.is_empty() { parse_usize(count_str) } else { 20 };
+                let n = unsafe {
+                    crate::types::hackbot_trace_read_sched_raw(
+                        buf.as_mut_ptr(), buf_size as i32, count as i32)
+                };
+                n
+            } else {
+                unsafe { crate::types::hackbot_trace_read_sched(buf.as_mut_ptr(), buf_size as i32) }
+            };
+            if n > 0 {
+                let _ = output.extend_from_slice(&buf[..n as usize], GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(b"[No scheduler trace data]\n", GFP_KERNEL);
+            }
+        }
+        b"syscall" => {
+            let (maybe_raw, count_str) = split_tool_args(subargs);
+            let n = if maybe_raw == b"raw" {
+                let count = if !count_str.is_empty() { parse_usize(count_str) } else { 20 };
+                unsafe {
+                    crate::types::hackbot_trace_read_syscall_raw(
+                        buf.as_mut_ptr(), buf_size as i32, count as i32)
+                }
+            } else {
+                unsafe { crate::types::hackbot_trace_read_syscall(buf.as_mut_ptr(), buf_size as i32) }
+            };
+            if n > 0 {
+                let _ = output.extend_from_slice(&buf[..n as usize], GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(b"[No syscall trace data]\n", GFP_KERNEL);
+            }
+        }
+        b"io" => {
+            let (maybe_raw, count_str) = split_tool_args(subargs);
+            let n = if maybe_raw == b"raw" {
+                let count = if !count_str.is_empty() { parse_usize(count_str) } else { 20 };
+                unsafe {
+                    crate::types::hackbot_trace_read_io_raw(
+                        buf.as_mut_ptr(), buf_size as i32, count as i32)
+                }
+            } else {
+                unsafe { crate::types::hackbot_trace_read_io(buf.as_mut_ptr(), buf_size as i32) }
+            };
+            if n > 0 {
+                let _ = output.extend_from_slice(&buf[..n as usize], GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(b"[No I/O trace data]\n", GFP_KERNEL);
+            }
+        }
+        b"reset" => {
+            unsafe { crate::types::hackbot_trace_reset() };
+            let _ = output.extend_from_slice(
+                b"Trace counters reset. Tracepoints still active.\n", GFP_KERNEL);
+        }
+        b"list" => {
+            let _ = output.extend_from_slice(
+                b"Active tracepoints: sched_switch, sys_enter, block_rq_complete\n\
+                  All registered at module load. Always-on continuous sensing.\n",
+                GFP_KERNEL);
+        }
+        _ => {
+            let _ = output.extend_from_slice(
+                b"Usage: trace <subsystem> [raw N]\n\
+                  Subsystems:\n\
+                  \x20 <tool>trace sched</tool>        - scheduler context switches\n\
+                  \x20 <tool>trace sched raw 20</tool> - last 20 raw events\n\
+                  \x20 <tool>trace syscall</tool>      - syscall patterns\n\
+                  \x20 <tool>trace io</tool>           - I/O latency + histogram\n\
+                  \x20 <tool>trace reset</tool>        - zero counters\n\
+                  \x20 <tool>trace list</tool>         - active tracepoints\n",
                 GFP_KERNEL,
             );
         }

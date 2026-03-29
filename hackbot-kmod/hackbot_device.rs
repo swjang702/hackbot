@@ -50,6 +50,12 @@ impl kernel::InPlaceModule for HackbotModule {
             VLLM_PORT,
         );
 
+        // Initialize continuous tracepoint sensing (Layer 0 — always-on senses).
+        let trace_ret = unsafe { crate::types::hackbot_trace_init() };
+        if trace_ret < 0 {
+            pr_warn!("hackbot: trace init failed ({}), continuing without sensing\n", trace_ret);
+        }
+
         // Start the autonomous patrol kthread.
         // Non-fatal: module works without patrol if vLLM is unreachable.
         let patrol_ret = unsafe { crate::types::hackbot_patrol_start() };
@@ -73,6 +79,8 @@ impl PinnedDrop for HackbotModule {
     fn drop(self: Pin<&mut Self>) {
         // Stop patrol thread FIRST — it may be using vLLM/tools/model.
         unsafe { crate::types::hackbot_patrol_stop() };
+        // Shutdown tracepoint sensing (synchronizes — waits for all CPUs).
+        unsafe { crate::types::hackbot_trace_exit() };
         // Clean up kprobes before unloading.
         unsafe { crate::types::hackbot_kprobe_cleanup() };
         free_model_resources();

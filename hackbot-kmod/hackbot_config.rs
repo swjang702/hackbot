@@ -54,6 +54,12 @@ pub(crate) const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- when you need live kernel 
   <tool>kprobe attach FUNC</tool>     - attach kprobe to kernel function (e.g. <tool>kprobe attach do_sys_openat2</tool>)\n\
   <tool>kprobe check</tool>           - show active kprobes with hit counts\n\
   <tool>kprobe detach FUNC</tool>     - remove a kprobe\n\n\
+  Always-on sensing (continuous tracepoints):\n\
+  <tool>trace sched</tool>            - scheduler context switches (summary + features)\n\
+  <tool>trace sched raw 20</tool>     - last 20 raw sched_switch events\n\
+  <tool>trace syscall</tool>          - syscall patterns and frequency\n\
+  <tool>trace io</tool>               - I/O latency histogram and LinnOS features\n\
+  <tool>trace reset</tool>            - zero counters for fresh measurement window\n\n\
 HOW TO USE:\n\
 - To call a tool, include <tool>name</tool> in your response\n\
 - You will receive the real output, then can analyze and discuss it\n\
