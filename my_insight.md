@@ -79,3 +79,14 @@ if you have any concerns, please let me know.
 ```
 Before we get started something, I wonder which way is the best for you to understand these docs and leverage in your work.? e.g., using chroma or, just reading files and write the sum up in the file and refer to it as working, and so on. which way to understand and refer to docs can be the best do to your work efficiently?
 
+
+/task_easy ultra think about these ideas and insights:
+1. @docs/refs/HyperAgents_summary.md
+2. @docs/refs/LinnOS_summary.md
+3. trace subsystem을 오감 으로..?!? tracepoint를 ftrace에서 on 하는 것처럼, hackbot에서 바로 access해서 그 지점들 데이터를 볼 수 있게끔..?!? 이게 되면 bpf 도 되지 않을까?? trace system을 in kernel llm의 눈과 귀로 달아주는 ; ebpf verifier 에 들어오는 것들 다 학습 or 추론?! / tracing sequence로 뭔가 학습해서 예측에 쓰일 수 있지 않을까.?
+4. in-kernel llm (ebpf 가 kernel verifier 처럼.?) (커널 trace data로 학습?? 경량 로컬 llm을 보완하는 방법? 커널의 동작 데이터가 엄청 많잖아.?!) (in kernel llm 이 보는것만 하면 그래도 괜찮은데 action이(손발) 주어지면 엄청 위험하지?! 그래서 formal verification?? 만약 이게 된다?? 그럼 os의 새로운 generation 아닐까?!) (observability and transparency)
+
+How's your thought??
+(FYI, For sensory system, even if there are already some ebpf tracer, what about directly accesss kerne trace systems and ebpf systems from in-kernel hackbot)
+
+
