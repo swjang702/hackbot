@@ -733,10 +733,57 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 | **2g** | Continuous tracepoint sensing layer (sched, syscall, I/O) | A | **DONE** |
 | **3** | In-kernel INT8 inference engine (System 1 reflex) | A | **DONE** (precision-limited) |
 | **3f** | FP16/float32 FPU inference path | A | **DONE** (verified correct, FP16 precision limit) |
-| **3a** | Add and connect the mcp server 'sequential-thinking' | B |  |
-| **4** | Hybrid System 1/2 merge | D | **NEXT** |
-| **5** | Action capabilities with Verus-verified safety | All | Research |
-| **6** | 3D game rendering of agent behavior | Frontend | After 4 |
+
+**Remaining Steps** — prioritized by impact:
+
+#### Immediate: Fix & Polish
+
+| Step | What | Why | Effort |
+|------|------|-----|--------|
+| **2h** | Larger context model on vLLM server | Current 6976-token limit causes overflow after 3 tool calls. #1 blocker for cross-subsystem investigation. Switch to 32K+ context model or configure rope scaling. | Config (vLLM server) |
+| **2i** | Conversation truncation | When nearing context limit, drop oldest tool results instead of crashing with HTTP 400. Agent gracefully degrades. | Medium |
+| **2j** | Cross-subsystem anomaly demo | Generate known anomaly (`dd`, `stress-ng`), hackbot investigates via trace sched + trace io + ps + mem, documents the correlation. THE killer research demo. | Quick (after 2h) |
+
+#### Short-term: Capability Expansion
+
+| Step | What | Why | Effort |
+|------|------|-----|--------|
+| **2k** | Structured memory (HyperAgents-inspired) | Evolve memory from raw text to `{observation, hypothesis, evidence, outcome}`. Enables meta-evaluation and smarter patrol. | Medium |
+| **2l** | Smarter patrol | Patrol reads trace aggregates FIRST (cheap). Only calls vLLM if anomaly indicators are non-zero. Currently wastes vLLM calls on idle systems. | Medium |
+| **2m** | More tracepoints | Add `sched_wakeup`, `net_dev_xmit`, `kmalloc`/`kfree` for network + memory sensing. Currently missing 2 of the 5 senses. | Medium |
+| **4** | Hybrid System 1/2 merge | System 1 (local) does fast triage, escalates to System 2 (vLLM) for deep analysis. True dual-brain architecture. | Large |
+
+#### Medium-term: Architecture Layers
+
+| Step | What | Why | Effort |
+|------|------|-----|--------|
+| **L1** | Layer 1 reflex classifier | Train LinnOS-style 3-layer NN on trace feature vectors (Tier 2). Binary: normal/anomalous. Feature pipeline already exists from Step 2g. | Large |
+| **L1t** | Online training pipeline | Patrol labels trace data via LLM reasoning → accumulated labels train Layer 1 classifier. LinnOS's LinnApp pipeline, but in-kernel. | Large |
+| **L3a** | Investigation strategy archive | Library of investigation procedures selected by anomaly type. Different anomalies need different tool sequences. HyperAgents-inspired. | Medium |
+| **L4a** | eBPF safety gate for Tier 2 actions | Agent generates BPF programs, BPF verifier validates before execution. The "eBPF as formal verifier" pattern. Enables safe kernel modification. | Large |
+
+#### Long-term: Research Goals
+
+| Step | What | Why | Effort |
+|------|------|-----|--------|
+| **L3b** | Self-improving strategies (Layer 3) | Meta-evaluation: which investigation strategies work? Evolve prompts/procedures over time. HyperAgents showed this emerges with persistent memory + self-modification. | Research |
+| **L4b** | Verus formal verification | Prove Tier 0-1 tools cannot corrupt kernel state. Safety guarantee for observation layer. | Research |
+| **6** | Visualization integration | Agent findings → events in game view. Patrol visible as character in process rooms. Connects kernel agent to visualization track. | Large |
+| **P** | Paper: Autonomic OS | Write up cross-subsystem demo, 5-layer architecture, and vision. Target: systems venue (OSDI/SOSP/EuroSys). | N/A |
+
+#### 5-Layer Architecture Status (see `docs/refs/hackbot_vision_synthesis.md`)
+
+```
+Layer 0: SENSORY      ████████████░░ ~80%  sched/syscall/I/O tracepoints DONE; network/memory TODO
+Layer 1: REFLEX       ░░░░░░░░░░░░░░  0%  Feature vectors ready; tiny NN classifier not yet built
+Layer 2: REASONING    ████████████░░ ~85%  7 tools + patrol + memory DONE; structured memory TODO
+Layer 3: SELF-IMPROVE ░░░░░░░░░░░░░░  0%  Designed via HyperAgents; not yet implemented
+Layer 4: SAFETY       ████░░░░░░░░░░ ~30%  Tier system DONE; Verus/eBPF-gate TODO
+```
+
+**Recommended next path**: 2h (larger context) → 2j (cross-subsystem demo) → 2k (structured memory) → L1 (reflex classifier)
+
+---
 
 **Step 2c details** — the OODA agent loop (DONE):
 - Three kernel observation tools: `ps` (two-pass walk, user-space first), `mem` (si_meminfo), `loadavg` (avenrun[])
