@@ -1,7 +1,7 @@
 # hackbot Implementation Plan
 
-**Date**: 2026-03-02 (updated 2026-03-28)
-**Status**: Phase 1 complete. In-kernel LLM through Step 2e: 6 tools (Tier 0-1), FP16 forward pass verified correct, temperature sampling. System 2 (vLLM) recommended for production use.
+**Date**: 2026-03-02 (updated 2026-03-29)
+**Status**: Phase 1 complete. In-kernel LLM through Step 2g: 7 tools + 3 always-on tracepoint sensors, autonomous patrol kthread, agent memory, continuous sensing layer (Layer 0). See `docs/refs/hackbot_vision_synthesis.md` for the 5-layer autonomic OS architecture vision.
 **Guiding Principle**: Visualization-first MVP, Rust backend for Verus alignment
 
 ---
@@ -729,6 +729,8 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 | **2c** | Dynamic agent loop + 3 kernel tools (OODA) | B | **DONE** |
 | **2d** | Tier 0-1 tool expansion: dmesg, files, kprobe (6 tools total) | B+A | **DONE** |
 | **2e** | FP16 inference diagnosis + temperature sampling | A | **DONE** |
+| **2f** | Autonomous patrol kthread + agent memory ring buffer | B+A | **DONE** |
+| **2g** | Continuous tracepoint sensing layer (sched, syscall, I/O) | A | **DONE** |
 | **3** | In-kernel INT8 inference engine (System 1 reflex) | A | **DONE** (precision-limited) |
 | **3f** | FP16/float32 FPU inference path | A | **DONE** (verified correct, FP16 precision limit) |
 | **3a** | Add and connect the mcp server 'sequential-thinking' | B |  |
@@ -778,6 +780,23 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 - **Finding**: Forward pass is CORRECT. Single token: correlation 1.000, max error 0.000025. 28+ tokens: degrades due to FP16 precision accumulating across 30 layers × N prefill steps.
 - **Solution**: Temperature + top-k sampling (T=0.70, K=40) in `hackbot_fpu_get_next_token()` via kernel CSPRNG
 - **System 1/2 framing**: Local (SmolLM2-135M, FP16) = fast reflexes. vLLM (Qwen 7B) = deep reasoning.
+
+**Step 2f details** — Autonomous patrol kthread + agent memory (DONE, 2026-03-28):
+- **Patrol kthread** (`hackbot_patrol.c`): Dedicated `[hackbot_patrol]` kthread via `kthread_run()`. Wakes every 120 seconds (30s initial delay). Calls `agent_loop()` with anomaly-detection prompt. Findings logged to dmesg and recorded in agent memory.
+- **Agent memory** (`hackbot_memory.rs`): Fixed-size ring buffer (8 entries × 512 bytes, no heap allocation). Stores timestamped findings from both patrol (`SOURCE_PATROL`) and user sessions (`SOURCE_USER`). Injected into vLLM system prompt via `format_memory_for_prompt()` so the agent references past observations.
+- **Integration test suite** (`test.sh`): Per-feature tests (lifecycle, I/O, tools, patrol, memory) with real-time dmesg output. Handles already-loaded module, `pipefail`-safe detection.
+- Non-fatal: patrol start failure doesn't prevent module load. vLLM errors during patrol are logged and skipped.
+
+**Step 2g details** — Continuous tracepoint sensing layer (DONE, 2026-03-29):
+- **Layer 0 sensory system**: Always-on tracepoint callbacks registered at module load via `for_each_kernel_tracepoint()` + `tracepoint_probe_register()` (standard tracepoints not exported to out-of-tree modules, discovered at runtime).
+- **Three tracepoints**: `sched_switch` (scheduler), `sys_enter` (syscalls), `block_rq_complete` (I/O latency).
+- **Three-tier data per tracepoint**:
+  - Tier 1: Raw event ring buffer (1024 events, ~64KB) — for investigation and replay
+  - Tier 2: LinnOS-style feature vectors (sliding window of last 4 values) — for future classifiers
+  - Tier 3: Aggregate stats (atomic counters, per-task, per-syscall, latency histogram) — for summaries
+- **Callbacks** run with preemption disabled, ~100ns each. Total overhead ~3% of one core on a busy server.
+- **Tool interface**: `<tool>trace sched</tool>`, `<tool>trace sched raw 20</tool>`, `<tool>trace syscall</tool>`, `<tool>trace io</tool>`, `<tool>trace reset</tool>`, `<tool>trace list</tool>`.
+- See `docs/refs/hackbot_vision_synthesis.md` for the 5-layer autonomic OS architecture this enables.
 
 **Why OODA before INT8**: The tool interface (Step 2c) is foundational — it defines what the agent CAN DO regardless of where inference runs. INT8 (Step 3) is a performance optimization of where inference runs. We validated the tool architecture with remote vLLM first (easier debugging, smarter model), then swap in the local INT8 engine.
 

@@ -921,3 +921,96 @@ Shortened `LOCAL_SYSTEM_PROMPT` from ~40 tokens to ~25 tokens. Every token of pr
 - `hackbot_forward.rs` — Check and log FPU forward return values
 - `hackbot_config.rs` — Shortened `LOCAL_SYSTEM_PROMPT`
 - `tools/verify_fp16_forward.py` — **New**: FP16 forward pass verification against HuggingFace
+
+---
+
+## Autonomous Patrol + Agent Memory (Step 2f)
+
+**Status**: Complete
+**Date**: 2026-03-28
+
+### Patrol Kthread
+
+A dedicated kernel thread `[hackbot_patrol]` that wakes every 120 seconds, runs the vLLM agent loop with an anomaly-detection prompt, and records findings into the agent memory.
+
+- `hackbot_patrol.c`: C kthread helper using `kthread_run()`, `schedule_timeout_interruptible()` for sleep, 30-second initial delay
+- Clean shutdown: `kthread_stop()` wakes sleeping thread; blocks until current vLLM call completes
+- Non-fatal: patrol start failure doesn't prevent module load
+
+### Agent Memory Ring Buffer
+
+Fixed-size ring buffer (8 entries x 512 bytes) in `hackbot_memory.rs`:
+- Stores timestamped findings from both patrol (`SOURCE_PATROL`) and user sessions (`SOURCE_USER`)
+- Injected into vLLM system prompt via `format_memory_for_prompt()` before each query
+- Oldest-first chronological order; ring buffer overwrites oldest entry
+- No heap allocation — all fixed-size arrays inside the Mutex
+
+### Integration Test Suite
+
+`test.sh` with per-feature tests: module lifecycle, basic I/O, tool dispatch, patrol thread, agent memory. Real-time dmesg output, handles already-loaded module via pipefail-safe detection.
+
+### Files Created/Modified
+
+- `hackbot_patrol.c`, `hackbot_patrol.h` — C kthread helper
+- `hackbot_memory.rs` — Agent memory ring buffer + patrol tick callback
+- `hackbot_config.rs` — PATROL_INTERVAL_SECS, PATROL_PROMPT, MEMORY_* constants
+- `hackbot_device.rs` — Init memory + start/stop patrol in lifecycle
+- `hackbot_vllm.rs` — Inject memory into system prompt, record user findings
+- `test.sh` — Integration test suite
+
+---
+
+## Continuous Tracepoint Sensing Layer (Step 2g)
+
+**Status**: Complete
+**Date**: 2026-03-29
+
+### Overview
+
+Layer 0 of the autonomic OS architecture — always-on kernel tracepoint callbacks that register at module load and continuously accumulate data. hackbot's "eyes and ears."
+
+The key insight: hackbot is already in ring 0. It doesn't need eBPF for observation — it registers tracepoint callbacks directly using `for_each_kernel_tracepoint()` + `tracepoint_probe_register()` (standard tracepoints like `sched_switch` are not exported to out-of-tree modules, so they're discovered at runtime).
+
+### Three Tracepoints
+
+| Tracepoint | Subsystem | What it reveals |
+|------------|-----------|-----------------|
+| `sched_switch` | Scheduler | Context switches, per-task activity, switch intervals |
+| `sys_enter` | Syscalls | Syscall patterns, frequency, sequences |
+| `block_rq_complete` | Storage I/O | I/O latency, queue depth, completion rates |
+
+### Three-Tier Data Architecture
+
+Each tracepoint callback (~100ns, preemption disabled) updates three data structures simultaneously:
+
+1. **Raw event ring buffer** (Tier 1): Last 1024 events with full context (timestamps, PIDs, CPU, comm). For investigation and replay. ~64KB per tracepoint.
+
+2. **Feature vector** (Tier 2): LinnOS-style sliding window — last 4 switch intervals, last 4 I/O latencies, queue depths. Fixed-size, always ready for future classifier inference. Protected by raw_spinlock (~20ns).
+
+3. **Aggregate stats** (Tier 3): Atomic counters — total events, per-task counts (64 slots), per-syscall counts (512 slots), I/O latency histogram (8 buckets). No locking needed.
+
+### Tool Interface (7th tool)
+
+```
+<tool>trace sched</tool>         → aggregate summary + features + notable events
+<tool>trace sched raw 20</tool>  → last 20 raw sched_switch events
+<tool>trace syscall</tool>       → syscall patterns and frequency
+<tool>trace io</tool>            → I/O latency histogram + LinnOS features
+<tool>trace reset</tool>         → zero "since reset" counters
+<tool>trace list</tool>          → active tracepoints
+```
+
+### Overhead Budget
+
+~3.1% of one core total on a busy server (sched ~1.0%, syscall ~1.6%, I/O ~0.5%). Comparable to LinnOS's measured 0.3-0.7% for a single subsystem.
+
+### Files Created/Modified
+
+- `hackbot_trace.c` — Three-tier tracepoint sensing (~620 lines C)
+- `hackbot_trace.h` — C header for FFI
+- `hackbot_tools.rs` — `tool_trace()` with sched/syscall/io/raw/reset/list subcommands
+- `hackbot_types.rs` — FFI declarations for trace functions
+- `hackbot_config.rs` — Updated `TOOL_DESCRIPTION` with trace tool
+- `hackbot_device.rs` — `hackbot_trace_init/exit()` in module lifecycle
+- `Kbuild` — Added `hackbot_trace.o`
+- `TESTING.md` — Comprehensive trace testing guide (Section 8)
