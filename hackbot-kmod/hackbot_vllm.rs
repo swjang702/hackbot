@@ -237,6 +237,11 @@ fn agent_loop_vllm(prompt: &[u8]) -> Result<KVVec<u8>> {
     let mut final_answer = KVVec::new();
     let mut got_final_answer = false;
 
+    // Track last tool pair for context-aware truncation rebuild.
+    let mut last_asst = KVVec::new();
+    let mut last_tool = KVVec::new();
+    let mut has_tool_history = false;
+
     for iteration in 0..MAX_AGENT_ITERATIONS {
         pr_info!(
             "hackbot: agent iteration {}/{}\n",
@@ -244,13 +249,25 @@ fn agent_loop_vllm(prompt: &[u8]) -> Result<KVVec<u8>> {
             MAX_AGENT_ITERATIONS,
         );
 
-        if messages.len() > MAX_CONVERSATION_SIZE {
-            pr_warn!("hackbot: conversation exceeded {} bytes, stopping\n", MAX_CONVERSATION_SIZE);
-            let _ = final_answer.extend_from_slice(
-                b"\n[hackbot] Agent stopped: conversation too large.\n",
-                GFP_KERNEL,
-            );
-            break;
+        // Context budget: rebuild conversation if over limit (sliding window).
+        // Keeps system + user + last tool pair, discards older tool results.
+        if messages.len() > VLLM_CONTEXT_BUDGET {
+            pr_info!("hackbot: truncating conversation ({} bytes > {} budget)\n",
+                     messages.len(), VLLM_CONTEXT_BUDGET);
+            messages = KVVec::new();
+            append_message_to_json(&mut messages, b"system", &system_content);
+            append_message_to_json(&mut messages, b"user", prompt);
+            if has_tool_history {
+                let mut noted_asst = KVVec::new();
+                let _ = noted_asst.extend_from_slice(
+                    b"[Earlier tool calls were truncated to fit context.] ",
+                    GFP_KERNEL,
+                );
+                let _ = noted_asst.extend_from_slice(&last_asst, GFP_KERNEL);
+                append_message_to_json(&mut messages, b"assistant", &noted_asst);
+                append_message_to_json(&mut messages, b"user", &last_tool);
+            }
+            pr_info!("hackbot: truncated to {} bytes\n", messages.len());
         }
 
         let response = match vllm_call(&model_name, &messages) {
@@ -313,6 +330,13 @@ fn agent_loop_vllm(prompt: &[u8]) -> Result<KVVec<u8>> {
 Analyze it thoughtfully and respond to the user.",
                     GFP_KERNEL,
                 );
+
+                // Save last pair for potential truncation rebuild.
+                last_asst.truncate(0);
+                let _ = last_asst.extend_from_slice(&assistant_content, GFP_KERNEL);
+                last_tool.truncate(0);
+                let _ = last_tool.extend_from_slice(&tool_result, GFP_KERNEL);
+                has_tool_history = true;
 
                 append_message_to_json(&mut messages, b"assistant", &assistant_content);
                 append_message_to_json(&mut messages, b"user", &tool_result);

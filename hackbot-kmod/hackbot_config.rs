@@ -32,8 +32,10 @@ pub(crate) const MAX_PS_TASKS: usize = 512;
 /// Per-tool output limit. Reduced from 8KB to 4KB to fit more tool calls
 /// within the vLLM model's context window (6976 tokens ≈ ~5200 bytes of text).
 pub(crate) const MAX_TOOL_OUTPUT: usize = 4 * 1024;
-/// Maximum conversation size sent to vLLM (96 KB).
-pub(crate) const MAX_CONVERSATION_SIZE: usize = 96 * 1024;
+/// Context budget in bytes for the JSON messages array sent to vLLM.
+/// ~16KB allows ~4000 tokens of input, leaving room for output.
+/// Scale up when using models with larger context windows.
+pub(crate) const VLLM_CONTEXT_BUDGET: usize = 16 * 1024;
 /// Maximum output tokens requested from vLLM per call.
 /// Must fit within the model's context window minus prompt tokens.
 /// Qwen2.5-7B-AWQ has 6976 tokens total; prompt uses ~2000-5000 tokens.
