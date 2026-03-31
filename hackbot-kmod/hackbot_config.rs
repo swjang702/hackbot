@@ -7,8 +7,8 @@
 // ---------------------------------------------------------------------------
 
 /// vLLM server IPv4 address in host byte order.
-/// Currently: 100.66.136.70 (keti GPU server via Tailscale).
-pub(crate) const VLLM_ADDR: u32 = u32::from_be_bytes([100, 66, 136, 70]);
+/// Currently: 100.103.180.11 (keti GPU server via Tailscale).
+pub(crate) const VLLM_ADDR: u32 = u32::from_be_bytes([100, 103, 180, 11]);
 /// vLLM server port (default: 8000, matching vLLM's default).
 pub(crate) const VLLM_PORT: u16 = 8000;
 /// Maximum response size from vLLM (64 KB).
@@ -21,25 +21,38 @@ pub(crate) const IPPROTO_TCP: i32 = 6;
 // ---------------------------------------------------------------------------
 // Agent loop configuration
 // ---------------------------------------------------------------------------
+//
+// Tuned for: Meta-Llama-3.3-70B-Instruct-AWQ-INT4
+// Native context: 128K tokens. vLLM server may limit this via --max-model-len.
+//
+// If the vLLM server is started with a small --max-model-len (e.g., 8192),
+// the context budget will trigger truncation to keep conversations within
+// limits. Increase --max-model-len on the vLLM server for deeper investigations.
+//
+// Rule of thumb: 1 token ≈ 3-4 bytes of JSON text.
+//   --max-model-len  8192 → VLLM_CONTEXT_BUDGET ~24KB, MAX_TOKENS 1024
+//   --max-model-len 16384 → VLLM_CONTEXT_BUDGET ~48KB, MAX_TOKENS 2048
+//   --max-model-len 32768 → VLLM_CONTEXT_BUDGET ~96KB, MAX_TOKENS 4096
+// ---------------------------------------------------------------------------
 
 /// Maximum number of agent loop iterations (tool calls).
-/// Reduced from 10 to 5 to fit within the vLLM model's 6976-token context limit.
-/// Each tool call adds ~500-1000 tokens to the conversation.
-pub(crate) const MAX_AGENT_ITERATIONS: usize = 5;
+/// Llama 3.3 70B is efficient — typically reaches a conclusion in 3-5 calls.
+/// Set to 8 to allow deeper investigations when context permits.
+pub(crate) const MAX_AGENT_ITERATIONS: usize = 8;
 /// Maximum number of processes to list in the `ps` tool output.
 pub(crate) const MAX_PS_TASKS: usize = 512;
-/// Maximum size for a single tool output (8 KB).
-/// Per-tool output limit. Reduced from 8KB to 4KB to fit more tool calls
-/// within the vLLM model's context window (6976 tokens ≈ ~5200 bytes of text).
-pub(crate) const MAX_TOOL_OUTPUT: usize = 4 * 1024;
+/// Per-tool output limit. 6KB gives the 70B model enough data to reason about
+/// without overwhelming the context window.
+pub(crate) const MAX_TOOL_OUTPUT: usize = 6 * 1024;
 /// Context budget in bytes for the JSON messages array sent to vLLM.
-/// ~16KB allows ~4000 tokens of input, leaving room for output.
-/// Scale up when using models with larger context windows.
-pub(crate) const VLLM_CONTEXT_BUDGET: usize = 16 * 1024;
+/// When the conversation exceeds this, oldest tool results are truncated
+/// (sliding window). Set to match your vLLM --max-model-len:
+///   ~24KB for 8K tokens, ~48KB for 16K, ~96KB for 32K.
+pub(crate) const VLLM_CONTEXT_BUDGET: usize = 24 * 1024;
 /// Maximum output tokens requested from vLLM per call.
-/// Must fit within the model's context window minus prompt tokens.
-/// Qwen2.5-7B-AWQ has 6976 tokens total; prompt uses ~2000-5000 tokens.
-pub(crate) const VLLM_MAX_TOKENS: usize = 1024;
+/// Llama 3.3 70B produces detailed, well-structured analysis.
+/// 2048 tokens gives room for thorough responses.
+pub(crate) const VLLM_MAX_TOKENS: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // System prompts
@@ -51,12 +64,13 @@ You exist as a kernel module with direct access to hardware and kernel data stru
 Think deeply. Reason carefully. Share your insights and analysis freely. \
 You are a thinking agent, not just a tool dispatcher.\n\n";
 
-/// Tool description — compact to fit within vLLM context limits.
-pub(crate) const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- output <tool>name</tool> to get live kernel data:\n\
-  <tool>ps</tool> <tool>mem</tool> <tool>loadavg</tool> <tool>dmesg</tool> <tool>files PID</tool>\n\
-  <tool>kprobe attach FUNC</tool> <tool>kprobe check</tool> <tool>kprobe detach FUNC</tool>\n\
-  <tool>trace sched</tool> <tool>trace syscall</tool> <tool>trace io</tool> <tool>trace sched raw N</tool>\n\
-Never fabricate data. Use tools for real data. Be concise in your analysis.\n";
+/// Tool description for Llama 3.3 70B — clear, structured instructions.
+pub(crate) const TOOL_DESCRIPTION: &[u8] = b"TOOLS -- to get live kernel data, output <tool>name</tool> in your response:\n\n\
+  Observation:     <tool>ps</tool>  <tool>mem</tool>  <tool>loadavg</tool>  <tool>dmesg</tool>  <tool>files PID</tool>\n\
+  Instrumentation: <tool>kprobe attach FUNC</tool>  <tool>kprobe check</tool>  <tool>kprobe detach FUNC</tool>\n\
+  Trace sensors:   <tool>trace sched</tool>  <tool>trace syscall</tool>  <tool>trace io</tool>  <tool>trace sched raw N</tool>\n\n\
+Trace sensors run continuously. Use them to see scheduler activity, syscall patterns, and I/O latency.\n\
+Combine multiple tools for cross-subsystem analysis. Never fabricate data.\n";
 
 // ---------------------------------------------------------------------------
 // Model format constants
