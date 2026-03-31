@@ -242,6 +242,11 @@ fn agent_loop_vllm(prompt: &[u8]) -> Result<KVVec<u8>> {
     let mut last_tool = KVVec::new();
     let mut has_tool_history = false;
 
+    // Track tools used for structured memory recording.
+    let mut tools_buf = [0u8; 64];
+    let mut tools_len: usize = 0;
+    let mut tool_count: u8 = 0;
+
     for iteration in 0..MAX_AGENT_ITERATIONS {
         pr_info!(
             "hackbot: agent iteration {}/{}\n",
@@ -298,6 +303,18 @@ fn agent_loop_vllm(prompt: &[u8]) -> Result<KVVec<u8>> {
                     core::str::from_utf8(name).unwrap_or("?"),
                     iteration + 1,
                 );
+
+                // Accumulate tool name for structured memory.
+                if tools_len > 0 && tools_len < 63 {
+                    tools_buf[tools_len] = b',';
+                    tools_len += 1;
+                }
+                let copy = name.len().min(64usize.saturating_sub(tools_len));
+                if copy > 0 {
+                    tools_buf[tools_len..tools_len + copy].copy_from_slice(&name[..copy]);
+                    tools_len += copy;
+                }
+                tool_count = tool_count.saturating_add(1);
 
                 if iteration == MAX_AGENT_ITERATIONS - 1 {
                     pr_info!("hackbot: last iteration, forcing final answer with raw tool output\n");
@@ -360,7 +377,12 @@ Analyze it thoughtfully and respond to the user.",
 
     // Record this interaction in agent memory for future context.
     if got_final_answer && !final_answer.is_empty() {
-        crate::memory::record_finding(crate::config::SOURCE_USER, &final_answer);
+        crate::memory::record_finding(
+            crate::config::SOURCE_USER,
+            &final_answer,
+            &tools_buf[..tools_len],
+            tool_count,
+        );
     }
 
     Ok(final_answer)
