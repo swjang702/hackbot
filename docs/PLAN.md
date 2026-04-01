@@ -1,7 +1,7 @@
 # hackbot Implementation Plan
 
-**Date**: 2026-03-02 (updated 2026-03-29)
-**Status**: Phase 1 complete. In-kernel LLM through Step 2g: 7 tools + 3 always-on tracepoint sensors, autonomous patrol kthread, agent memory, continuous sensing layer (Layer 0). See `docs/refs/hackbot_vision_synthesis.md` for the 5-layer autonomic OS architecture vision.
+**Date**: 2026-03-02 (updated 2026-04-01)
+**Status**: Phase 1 complete. In-kernel LLM through Step 2k: 7 tools + 3 always-on tracepoint sensors, autonomous patrol kthread, structured agent memory with tool tracking, context-aware conversation truncation, tuned for Meta-Llama-3.3-70B-Instruct-AWQ-INT4. Next: cross-subsystem anomaly demo (Step 2j). See `docs/refs/hackbot_vision_synthesis.md` for the 5-layer autonomic OS architecture vision.
 **Guiding Principle**: Visualization-first MVP, Rust backend for Verus alignment
 
 ---
@@ -733,22 +733,23 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 | **2g** | Continuous tracepoint sensing layer (sched, syscall, I/O) | A | **DONE** |
 | **3** | In-kernel INT8 inference engine (System 1 reflex) | A | **DONE** (precision-limited) |
 | **3f** | FP16/float32 FPU inference path | A | **DONE** (verified correct, FP16 precision limit) |
+| **2h** | Config tuned for Meta-Llama-3.3-70B-Instruct-AWQ-INT4 | B | **DONE** |
+| **2i** | Context-aware conversation truncation (sliding window) | B | **DONE** |
+| **2k** | Structured memory with tool tracking (HyperAgents-inspired) | B+A | **DONE** |
 
 **Remaining Steps** — prioritized by impact:
 
-#### Immediate: Fix & Polish
+#### Immediate: Validate & Demo
 
 | Step | What | Why | Effort |
 |------|------|-----|--------|
-| **2h** | Larger context model on vLLM server | Current 6976-token limit causes overflow after 3 tool calls. #1 blocker for cross-subsystem investigation. Switch to 32K+ context model or configure rope scaling. | Config (vLLM server) |
-| **2i** | Conversation truncation | When nearing context limit, drop oldest tool results instead of crashing with HTTP 400. Agent gracefully degrades. | Medium |
-| **2j** | Cross-subsystem anomaly demo | Generate known anomaly (`dd`, `stress-ng`), hackbot investigates via trace sched + trace io + ps + mem, documents the correlation. THE killer research demo. | Quick (after 2h) |
+| **2h-server** | Increase vLLM `--max-model-len` on KETI server | Llama 3.3 supports 128K native, but server may limit to ~7K. Increase to 16K+ for deeper investigations. | Server config |
+| **2j** | Cross-subsystem anomaly demo | Generate known anomaly (`dd`, `stress-ng`), hackbot investigates via trace sched + trace io + ps + mem, documents the correlation. THE killer research demo. All code is ready. | Quick (test & document) |
 
 #### Short-term: Capability Expansion
 
 | Step | What | Why | Effort |
 |------|------|-----|--------|
-| **2k** | Structured memory (HyperAgents-inspired) | Evolve memory from raw text to `{observation, hypothesis, evidence, outcome}`. Enables meta-evaluation and smarter patrol. | Medium |
 | **2l** | Smarter patrol | Patrol reads trace aggregates FIRST (cheap). Only calls vLLM if anomaly indicators are non-zero. Currently wastes vLLM calls on idle systems. | Medium |
 | **2m** | More tracepoints | Add `sched_wakeup`, `net_dev_xmit`, `kmalloc`/`kfree` for network + memory sensing. Currently missing 2 of the 5 senses. | Medium |
 | **4** | Hybrid System 1/2 merge | System 1 (local) does fast triage, escalates to System 2 (vLLM) for deep analysis. True dual-brain architecture. | Large |
@@ -774,14 +775,14 @@ Build **OODA tools first** because they define the interface BOTH systems use. T
 #### 5-Layer Architecture Status (see `docs/refs/hackbot_vision_synthesis.md`)
 
 ```
-Layer 0: SENSORY      ████████████░░ ~80%  sched/syscall/I/O tracepoints DONE; network/memory TODO
-Layer 1: REFLEX       ░░░░░░░░░░░░░░  0%  Feature vectors ready; tiny NN classifier not yet built
-Layer 2: REASONING    ████████████░░ ~85%  7 tools + patrol + memory DONE; structured memory TODO
-Layer 3: SELF-IMPROVE ░░░░░░░░░░░░░░  0%  Designed via HyperAgents; not yet implemented
-Layer 4: SAFETY       ████░░░░░░░░░░ ~30%  Tier system DONE; Verus/eBPF-gate TODO
+Layer 0: SENSORY      ████████████░░ ~80%  3 tracepoints DONE; network/memory TODO
+Layer 1: REFLEX       ░░░░░░░░░░░░░░  0%  Feature vectors ready; classifier not built
+Layer 2: REASONING    █████████████░ ~90%  7 tools + patrol + structured memory DONE
+Layer 3: SELF-IMPROVE ░░░░░░░░░░░░░░  0%  Designed via HyperAgents; not implemented
+Layer 4: SAFETY       ████░░░░░░░░░░ ~30%  Tier system DONE; Verus/eBPF TODO
 ```
 
-**Recommended next path**: 2h (larger context) → 2j (cross-subsystem demo) → 2k (structured memory) → L1 (reflex classifier)
+**Recommended next path**: 2h-server (vLLM context) → 2j (cross-subsystem demo) → 2l (smarter patrol) → L1 (reflex classifier)
 
 ---
 
