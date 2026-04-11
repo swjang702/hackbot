@@ -29,6 +29,8 @@
 #include <linux/timekeeping.h>
 #include <linux/slab.h>
 #include "hackbot_trace.h"
+#include "hackbot_tokenizer.h"
+#include "hackbot_ngram.h"
 
 /* ===================================================================
  * Configuration
@@ -220,6 +222,11 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 	atomic64_inc(&s->sched_agg.total);
 	atomic64_inc(&s->sched_agg.total_since_reset);
 
+	/* Tier 4: Semantic tokenization */
+	hackbot_tokenize_sched(prev, next, prev_state, now);
+	/* Tier 5: N-gram learning */
+	hackbot_ngram_process(hackbot_tokenizer_last_token());
+
 	/* Update per-task counter for 'next' */
 	{
 		int i, n = atomic_read(&s->sched_agg.n_tasks);
@@ -279,6 +286,11 @@ static void hackbot_probe_sys_enter(void *data, struct pt_regs *regs, long id)
 	atomic64_inc(&s->syscall_agg.total_since_reset);
 	if (id >= 0 && id < MAX_SYSCALL_ID)
 		atomic64_inc(&s->syscall_agg.per_syscall[id]);
+
+	/* Tier 4: Semantic tokenization */
+	hackbot_tokenize_syscall(regs, id, now);
+	/* Tier 5: N-gram learning */
+	hackbot_ngram_process(hackbot_tokenizer_last_token());
 }
 
 static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
@@ -333,6 +345,12 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 	else if (latency_us < 100000) bucket = 6;
 	else                          bucket = 7;
 	atomic64_inc(&s->io_agg.lat_buckets[bucket]);
+
+	/* Tier 4: Semantic tokenization */
+	hackbot_tokenize_io(rq, blk_status_to_errno(error), nr_bytes,
+			    latency_us, now);
+	/* Tier 5: N-gram learning */
+	hackbot_ngram_process(hackbot_tokenizer_last_token());
 }
 
 /* ===================================================================
@@ -688,6 +706,34 @@ void hackbot_trace_reset(void)
 }
 
 /* ===================================================================
+ * Token output (delegates to hackbot_tokenizer.c)
+ * =================================================================== */
+
+int hackbot_trace_read_tokens(char *out, int maxlen, int count)
+{
+	return hackbot_tokenizer_read(out, maxlen, count);
+}
+
+/* ===================================================================
+ * N-gram output (delegates to hackbot_ngram.c)
+ * =================================================================== */
+
+int hackbot_trace_read_ngram_surprise(char *out, int maxlen)
+{
+	return hackbot_ngram_read_surprise(out, maxlen);
+}
+
+int hackbot_trace_read_ngram_stats(char *out, int maxlen)
+{
+	return hackbot_ngram_read_stats(out, maxlen);
+}
+
+int hackbot_trace_read_ngram_alerts(char *out, int maxlen, int count)
+{
+	return hackbot_ngram_read_alerts(out, maxlen, count);
+}
+
+/* ===================================================================
  * Init / Exit
  * =================================================================== */
 
@@ -721,6 +767,20 @@ int hackbot_trace_init(void)
 
 	s->start_ns = ktime_get_raw_fast_ns();
 	s->reset_ns = s->start_ns;
+
+	/* Initialize semantic tokenizer (Tier 4) */
+	ret = hackbot_tokenizer_init();
+	if (ret) {
+		pr_warn("hackbot: trace: tokenizer init failed (%d)\n", ret);
+		/* Non-fatal: tracing works without tokenization */
+	}
+
+	/* Initialize n-gram learning (Tier 5) */
+	ret = hackbot_ngram_init();
+	if (ret) {
+		pr_warn("hackbot: trace: ngram init failed (%d)\n", ret);
+		/* Non-fatal: tracing works without n-gram learning */
+	}
 
 	/* Discover tracepoints by name */
 	s->tp_sched_switch = find_tracepoint("sched_switch");
@@ -805,6 +865,12 @@ void hackbot_trace_exit(void)
 
 	/* Ensure all CPUs have exited callbacks */
 	tracepoint_synchronize_unregister();
+
+	/* Shutdown n-gram learning (after tracepoints are unregistered) */
+	hackbot_ngram_exit();
+
+	/* Shutdown tokenizer */
+	hackbot_tokenizer_exit();
 
 	/* Free resources */
 	kvfree(s->sched_ring);

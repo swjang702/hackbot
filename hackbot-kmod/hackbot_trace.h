@@ -30,6 +30,14 @@ int  hackbot_trace_read_sched_raw(char *out, int maxlen, int count);
 int  hackbot_trace_read_syscall_raw(char *out, int maxlen, int count);
 int  hackbot_trace_read_io_raw(char *out, int maxlen, int count);
 
+/* Read semantic tokens (Tier 4). Returns bytes written. */
+int  hackbot_trace_read_tokens(char *out, int maxlen, int count);
+
+/* Read n-gram surprise scores (Tier 5). Returns bytes written. */
+int  hackbot_trace_read_ngram_surprise(char *out, int maxlen);
+int  hackbot_trace_read_ngram_stats(char *out, int maxlen);
+int  hackbot_trace_read_ngram_alerts(char *out, int maxlen, int count);
+
 /* Reset "since last reset" counters. */
 void hackbot_trace_reset(void);
 

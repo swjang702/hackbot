@@ -190,6 +190,14 @@ extern "C" {
     pub(crate) fn hackbot_trace_read_syscall_raw(out: *mut u8, maxlen: i32, count: i32) -> i32;
     /// Read raw I/O events. Returns bytes written.
     pub(crate) fn hackbot_trace_read_io_raw(out: *mut u8, maxlen: i32, count: i32) -> i32;
+    /// Read semantic token ring buffer. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_tokens(out: *mut u8, maxlen: i32, count: i32) -> i32;
+    /// Read n-gram surprise scores. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_ngram_surprise(out: *mut u8, maxlen: i32) -> i32;
+    /// Read n-gram model statistics. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_ngram_stats(out: *mut u8, maxlen: i32) -> i32;
+    /// Read n-gram alerts. Returns bytes written.
+    pub(crate) fn hackbot_trace_read_ngram_alerts(out: *mut u8, maxlen: i32, count: i32) -> i32;
     /// Reset "since last reset" counters.
     pub(crate) fn hackbot_trace_reset();
 }

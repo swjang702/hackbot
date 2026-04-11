@@ -20,6 +20,7 @@
 #include <linux/delay.h>
 #include <linux/printk.h>
 #include "hackbot_patrol.h"
+#include "hackbot_ngram.h"
 
 /* Patrol interval in seconds — must match PATROL_INTERVAL_SECS in hackbot_config.rs */
 #define HACKBOT_PATROL_INTERVAL  120
@@ -51,11 +52,18 @@ static int hackbot_patrol_fn(void *data)
 		hackbot_patrol_tick();
 
 		/*
-		 * Sleep for the patrol interval. This is interruptible:
-		 * kthread_stop() will wake us immediately for clean shutdown.
+		 * Sleep for the patrol interval, but wake early on anomaly
+		 * alerts from the n-gram detector. Returns 0 on timeout,
+		 * >0 if woken by alert.
 		 */
-		schedule_timeout_interruptible(
-			(unsigned long)HACKBOT_PATROL_INTERVAL * HZ);
+		{
+			long ret = hackbot_ngram_wait_or_timeout(
+				(unsigned long)HACKBOT_PATROL_INTERVAL * HZ);
+			if (ret > 0 && hackbot_ngram_has_pending_alerts()) {
+				pr_info("hackbot: patrol woken by anomaly alert\n");
+				hackbot_ngram_clear_pending();
+			}
+		}
 	}
 
 	pr_info("hackbot: patrol thread stopped\n");

@@ -620,6 +620,45 @@ fn tool_trace(output: &mut KVVec<u8>, args: &[u8]) {
                 let _ = output.extend_from_slice(b"[No I/O trace data]\n", GFP_KERNEL);
             }
         }
+        b"tokens" => {
+            let (count_str, _) = split_tool_args(subargs);
+            let count = if !count_str.is_empty() { parse_usize(count_str) } else { 20 };
+            let n = unsafe {
+                crate::types::hackbot_trace_read_tokens(
+                    buf.as_mut_ptr(), buf_size as i32, count as i32)
+            };
+            if n > 0 {
+                let _ = output.extend_from_slice(&buf[..n as usize], GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(b"[No token data]\n", GFP_KERNEL);
+            }
+        }
+        b"ngram" => {
+            let (subcmd2, count_str) = split_tool_args(subargs);
+            let n = if subcmd2 == b"stats" {
+                unsafe {
+                    crate::types::hackbot_trace_read_ngram_stats(
+                        buf.as_mut_ptr(), buf_size as i32)
+                }
+            } else if subcmd2 == b"alerts" {
+                let count = if !count_str.is_empty() { parse_usize(count_str) } else { 10 };
+                unsafe {
+                    crate::types::hackbot_trace_read_ngram_alerts(
+                        buf.as_mut_ptr(), buf_size as i32, count as i32)
+                }
+            } else {
+                /* Default: show surprise scores */
+                unsafe {
+                    crate::types::hackbot_trace_read_ngram_surprise(
+                        buf.as_mut_ptr(), buf_size as i32)
+                }
+            };
+            if n > 0 {
+                let _ = output.extend_from_slice(&buf[..n as usize], GFP_KERNEL);
+            } else {
+                let _ = output.extend_from_slice(b"[No n-gram data]\n", GFP_KERNEL);
+            }
+        }
         b"reset" => {
             unsafe { crate::types::hackbot_trace_reset() };
             let _ = output.extend_from_slice(
@@ -639,6 +678,10 @@ fn tool_trace(output: &mut KVVec<u8>, args: &[u8]) {
                   \x20 <tool>trace sched raw 20</tool> - last 20 raw events\n\
                   \x20 <tool>trace syscall</tool>      - syscall patterns\n\
                   \x20 <tool>trace io</tool>           - I/O latency + histogram\n\
+                  \x20 <tool>trace tokens 20</tool>    - last 20 semantic tokens\n\
+                  \x20 <tool>trace ngram</tool>        - n-gram surprise scores\n\
+                  \x20 <tool>trace ngram stats</tool>  - n-gram model statistics\n\
+                  \x20 <tool>trace ngram alerts</tool> - recent anomaly alerts\n\
                   \x20 <tool>trace reset</tool>        - zero counters\n\
                   \x20 <tool>trace list</tool>         - active tracepoints\n",
                 GFP_KERNEL,
