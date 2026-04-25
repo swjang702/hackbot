@@ -266,7 +266,7 @@ pub(crate) fn format_memory_for_prompt(buf: &mut KVVec<u8>) {
 // Patrol tick — called from C kthread
 // ---------------------------------------------------------------------------
 
-/// Called by the C kthread (`hackbot_patrol.c`) every PATROL_INTERVAL_SECS.
+/// Called by the C kthread (`hackbot_patrol.c`) every HACKBOT_PATROL_INTERVAL seconds.
 #[no_mangle]
 #[allow(unreachable_pub)]
 pub extern "C" fn hackbot_patrol_tick() {

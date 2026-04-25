@@ -99,8 +99,6 @@ pub(crate) const TOKEN_IM_END: u32 = 2;
 
 /// Maximum new tokens to generate in a single inference call.
 pub(crate) const MAX_GEN_TOKENS: usize = 128;
-/// Maximum raw input bytes for a single prompt to encode_bpe.
-pub(crate) const MAX_ENCODE_INPUT: usize = 1024;
 /// Maximum preprocessed bytes after GPT-2 byte encoding.
 pub(crate) const MAX_PREPROC_INPUT: usize = 2048;
 
@@ -132,17 +130,15 @@ pub(crate) const LOCAL_MAX_TOOL_OUTPUT: usize = 512;
 // ---------------------------------------------------------------------------
 // Autonomous patrol configuration
 // ---------------------------------------------------------------------------
-
-/// Patrol interval in seconds. The kthread sleeps this long between cycles.
-pub(crate) const PATROL_INTERVAL_SECS: u64 = 120;
+//
+// Patrol interval (seconds) is the authoritative HACKBOT_PATROL_INTERVAL
+// macro in hackbot_patrol.c. The kthread is C-driven so the constant lives
+// there to avoid drift between Rust and C definitions.
 
 /// System prompt for patrol cycles — focused on anomaly detection.
 pub(crate) const PATROL_PROMPT: &[u8] = b"Autonomous patrol. Use tools to check system state. \
 Report anomalies: unusual processes, high memory/CPU, suspicious activity, \
 state changes. Be concise. If nothing unusual, say 'System nominal.'";
-
-/// Maximum agent iterations during patrol (fewer than interactive to save time).
-pub(crate) const PATROL_MAX_ITERATIONS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Agent memory configuration
@@ -150,8 +146,6 @@ pub(crate) const PATROL_MAX_ITERATIONS: usize = 5;
 
 /// Maximum entries in the agent memory ring buffer.
 pub(crate) const MEMORY_MAX_ENTRIES: usize = 8;
-/// Maximum bytes per memory entry (findings are truncated to this).
-pub(crate) const MEMORY_MAX_ENTRY_SIZE: usize = 512;
 
 /// Source tags for memory entries.
 pub(crate) const SOURCE_PATROL: &[u8] = b"patrol";

@@ -16,7 +16,7 @@ pub(crate) fn agent_loop(prompt: &[u8]) -> Result<KVVec<u8>> {
     let use_local = match INFERENCE_MODE {
         INFERENCE_MODE_LOCAL => true,
         INFERENCE_MODE_VLLM => false,
-        _ => {
+        INFERENCE_MODE_AUTO | _ => {
             let slot = MODEL.lock();
             slot.loaded
         }

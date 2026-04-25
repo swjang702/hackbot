@@ -6,7 +6,6 @@ use kernel::{bindings, prelude::*};
 
 use crate::config::*;
 use crate::forward::{forward_token, reset_kv_cache};
-use crate::model::read_u16_le;
 use crate::types::*;
 
 /// GPT-2 byte→Unicode codepoint mapping table.

@@ -6,6 +6,13 @@
 use crate::config::*;
 
 /// Parsed model configuration from the binary header.
+///
+/// Fields marked `#[allow(dead_code)]` are part of the binary file format
+/// (parsed in hackbot_model.rs) but not currently consumed at runtime —
+/// `seq_len` is overridden by INFERENCE_MAX_SEQ, `kv_dim` is computed from
+/// `n_kv_heads * head_dim`, and `rope_theta` is hardcoded in hackbot_fpu.c.
+/// Keep them to preserve round-trip with the Python exporter and to document
+/// the on-disk layout for future use.
 #[derive(Copy, Clone)]
 pub(crate) struct ModelConfig {
     pub(crate) dim: u32,
@@ -14,11 +21,11 @@ pub(crate) struct ModelConfig {
     pub(crate) n_heads: u32,
     pub(crate) n_kv_heads: u32,
     pub(crate) vocab_size: u32,
-    pub(crate) seq_len: u32,
+    #[allow(dead_code)] pub(crate) seq_len: u32,
     pub(crate) group_size: u32,
     pub(crate) head_dim: u32,
-    pub(crate) kv_dim: u32,
-    pub(crate) rope_theta: u32,
+    #[allow(dead_code)] pub(crate) kv_dim: u32,
+    #[allow(dead_code)] pub(crate) rope_theta: u32,
 }
 
 impl ModelConfig {
@@ -30,12 +37,16 @@ impl ModelConfig {
 }
 
 /// Reference to a quantized INT8 weight matrix within the firmware blob.
+///
+/// `rows`/`cols` are recorded for documentation / future use. The matmul
+/// callers in hackbot_forward.rs pass these dimensions explicitly from the
+/// model config, so the Q8Ref copies are not read at runtime today.
 #[derive(Copy, Clone)]
 pub(crate) struct Q8Ref {
     pub(crate) data_off: usize,
     pub(crate) scale_off: usize,
-    pub(crate) rows: usize,
-    pub(crate) cols: usize,
+    #[allow(dead_code)] pub(crate) rows: usize,
+    #[allow(dead_code)] pub(crate) cols: usize,
 }
 
 impl Q8Ref {
