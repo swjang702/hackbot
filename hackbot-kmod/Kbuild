@@ -4,6 +4,29 @@
 obj-m := hackbot.o
 hackbot-y := hackbot_main.o hackbot_fpu.o hackbot_console.o hackbot_files.o hackbot_kprobe.o hackbot_patrol.o hackbot_trace.o hackbot_tokenizer.o hackbot_ngram.o
 
+# === Safety: sanitizers (active when the host kernel supports them) ===
+# These add no overhead if the kernel was built without CONFIG_KASAN/UBSAN/KCSAN.
+# When the kernel HAS them, our module is fully instrumented:
+#   KASAN  — out-of-bounds, use-after-free, double-free  (CONFIG_KASAN=y)
+#   UBSAN  — integer overflow, shift-out-of-range, UB    (CONFIG_UBSAN=y)
+#   KCSAN  — data races in lockless/Hogwild code          (CONFIG_KCSAN=y)
+KASAN_SANITIZE := y
+UBSAN_SANITIZE := y
+KCSAN_SANITIZE := y
+
+# === Safety: extra compiler warnings ===
+ccflags-y += -Wframe-larger-than=1024   # kernel stack is 8-16KB; catch large frames
+ccflags-y += -Wvla                      # ban variable-length arrays (stack overflow risk)
+ccflags-y += -g3 -Wall -Wextra -Wdouble-promotion -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion
+
+# Note: an "objtool: ... falls through to next function" warning may appear
+# from the Rust-compiled hackbot_main.o. This is a known kernel-Rust+objtool
+# integration limitation (LTO can elide a trailing 'ret' when control-flow
+# analysis proves the epilogue is unreachable). It is benign: the symbol is
+# only ever entered via its address, never by fall-through. See:
+#   https://github.com/Rust-for-Linux/linux/issues
+# Module-level OBJECT_FILES_NON_STANDARD does not apply at modfinal LD.
+
 # Enable hardware FPU/SSE for the FPU helper — kernel builds with -msoft-float
 # by default. kernel_fpu_begin()/end() in hackbot_fpu.c save/restore FPU state
 # at runtime; this flag lets the compiler emit FPU instructions for that file.
