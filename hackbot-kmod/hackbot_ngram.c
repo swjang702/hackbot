@@ -666,6 +666,16 @@ void hackbot_ngram_exit(void)
 
 	st->active = false;
 
+	/*
+	 * Publish NULL before freeing memory. Any concurrent reader
+	 * (e.g., a stale function pointer or late patrol-thread call)
+	 * will see ngram == NULL and bail out before touching freed
+	 * memory. The smp_wmb() ensures the NULL is globally visible
+	 * before we free the backing allocations.
+	 */
+	WRITE_ONCE(ngram, NULL);
+	smp_wmb();
+
 	/* Wake anyone waiting on alerts so they can exit */
 	wake_up_all(&st->alert_wq);
 
@@ -685,5 +695,4 @@ void hackbot_ngram_exit(void)
 	kvfree(st->baseline);
 	kvfree(st->adaptive);
 	kfree(st);
-	ngram = NULL;
 }

@@ -229,7 +229,17 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 
 	/* Update per-task counter for 'next' */
 	{
-		int i, n = atomic_read(&s->sched_agg.n_tasks);
+		int i, n_raw, n;
+
+		/*
+		 * Clamp to MAX_TRACKED_TASKS to prevent out-of-bounds reads.
+		 * Multiple CPUs racing atomic_inc_return() below can push
+		 * n_tasks above MAX_TRACKED_TASKS; without this clamp, the
+		 * loop would read past the tasks[] array boundary.
+		 */
+		n_raw = atomic_read(&s->sched_agg.n_tasks);
+		n = (n_raw < MAX_TRACKED_TASKS) ? n_raw : MAX_TRACKED_TASKS;
+
 		for (i = 0; i < n; i++) {
 			if (s->sched_agg.tasks[i].pid == next->pid) {
 				atomic64_inc(&s->sched_agg.tasks[i].count);
@@ -243,6 +253,12 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 				s->sched_agg.tasks[slot].pid = next->pid;
 				memcpy(s->sched_agg.tasks[slot].comm, next->comm, 16);
 				atomic64_set(&s->sched_agg.tasks[slot].count, 1);
+			} else {
+				/* Lost race — another CPU took the last slot.
+				 * Roll back to prevent n_tasks from growing
+				 * unboundedly, which would waste cycles in the
+				 * read loop above (clamped but still iterated). */
+				atomic_dec(&s->sched_agg.n_tasks);
 			}
 		}
 	}
@@ -409,7 +425,7 @@ int hackbot_trace_read_sched(char *out, int maxlen)
 {
 	struct hackbot_trace_state *s = trace_state;
 	int pos = 0;
-	long long total, since_reset, uptime_s;
+	long long total, uptime_s;
 	unsigned long flags;
 	int i, n;
 
@@ -419,7 +435,6 @@ int hackbot_trace_read_sched(char *out, int maxlen)
 	}
 
 	total = atomic64_read(&s->sched_agg.total);
-	since_reset = atomic64_read(&s->sched_agg.total_since_reset);
 	uptime_s = (long long)(ktime_get_raw_fast_ns() - s->start_ns) / 1000000000LL;
 
 	pos = append_str(out, pos, maxlen, "=== Scheduler Trace (active ");
@@ -434,8 +449,10 @@ int hackbot_trace_read_sched(char *out, int maxlen)
 		pos = append_str(out, pos, maxlen, "/s\n");
 	}
 
-	/* Top tasks */
+	/* Top tasks (clamp to array bounds — n_tasks can race past MAX) */
 	n = atomic_read(&s->sched_agg.n_tasks);
+	if (n > MAX_TRACKED_TASKS)
+		n = MAX_TRACKED_TASKS;
 	if (n > 0) {
 		pos = append_str(out, pos, maxlen, "Top tasks:");
 		/* Simple: show first 10 tasks (not sorted — good enough for now) */

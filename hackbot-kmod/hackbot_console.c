@@ -26,19 +26,42 @@ static DEFINE_RAW_SPINLOCK(hackbot_con_lock);
 /*
  * Console write callback.  Called by printk for every message.
  * Must be safe in any context (hardirq, NMI, early boot).
+ *
+ * Uses memcpy for bulk copies instead of per-byte loop to minimize
+ * lock hold time. Handles ring buffer wrap-around with at most two
+ * memcpy calls.
  */
 static void hackbot_console_write(struct console *con, const char *s,
 				  unsigned int count)
 {
 	unsigned long flags;
-	unsigned int i;
+	unsigned int first, second;
+
+	if (!count)
+		return;
+
+	/* If message exceeds buffer, keep only the tail. */
+	if (count > HACKBOT_CONSOLE_BUF_SIZE) {
+		s += count - HACKBOT_CONSOLE_BUF_SIZE;
+		count = HACKBOT_CONSOLE_BUF_SIZE;
+	}
 
 	raw_spin_lock_irqsave(&hackbot_con_lock, flags);
-	for (i = 0; i < count; i++) {
-		console_buf[console_head] = s[i];
-		console_head = (console_head + 1) % HACKBOT_CONSOLE_BUF_SIZE;
-	}
+
+	/* Bytes until end of buffer (before wrap). */
+	first = HACKBOT_CONSOLE_BUF_SIZE - console_head;
+	if (first > count)
+		first = count;
+
+	memcpy(console_buf + console_head, s, first);
+
+	second = count - first;
+	if (second > 0)
+		memcpy(console_buf, s + first, second);
+
+	console_head = (console_head + count) % HACKBOT_CONSOLE_BUF_SIZE;
 	console_total += count;
+
 	raw_spin_unlock_irqrestore(&hackbot_con_lock, flags);
 }
 
