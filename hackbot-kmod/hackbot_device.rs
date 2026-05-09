@@ -120,6 +120,13 @@ impl MiscDevice for HackbotDev {
     }
 
     fn write_iter(_kiocb: Kiocb<'_, Self::Ptr>, iov: &mut IovIterSource<'_>) -> Result<usize> {
+        // Reject oversized writes before any allocation to bound DoS exposure.
+        // Anyone with the device fd could otherwise force kvmalloc to attempt
+        // gigabytes (see R-014 in docs/REVIEW_v0.1.md).
+        if iov.len() > MAX_PROMPT_BYTES {
+            return Err(EFBIG);
+        }
+
         let mut prompt = KVVec::new();
         let len = iov.copy_from_iter_vec(&mut prompt, GFP_KERNEL)?;
 

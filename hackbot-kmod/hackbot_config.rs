@@ -13,6 +13,10 @@ pub(crate) const VLLM_ADDR: u32 = u32::from_be_bytes([100, 103, 180, 11]);
 pub(crate) const VLLM_PORT: u16 = 8000;
 /// Maximum response size from vLLM (64 KB).
 pub(crate) const MAX_RESPONSE_SIZE: usize = 64 * 1024;
+/// Maximum bytes accepted in a single write to /dev/hackbot.
+/// Larger writes are rejected with EFBIG before any allocation,
+/// preventing unprivileged kvmalloc DoS via huge user writes.
+pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 /// Receive buffer size for individual recv calls.
 pub(crate) const RECV_BUF_SIZE: usize = 4096;
 /// IPPROTO_TCP (stable since RFC 793).
