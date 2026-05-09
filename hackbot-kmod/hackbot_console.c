@@ -14,13 +14,14 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/printk.h>
+#include <linux/types.h>
 #include "hackbot_console.h"
 
 #define HACKBOT_CONSOLE_BUF_SIZE  (64 * 1024)   /* 64 KB ring buffer */
 
 static char console_buf[HACKBOT_CONSOLE_BUF_SIZE];
 static unsigned int console_head;     /* next write position (circular) */
-static unsigned int console_total;    /* total bytes ever written */
+static u64 console_total;              /* total bytes ever written */
 static DEFINE_RAW_SPINLOCK(hackbot_con_lock);
 
 /*
@@ -111,7 +112,7 @@ int hackbot_console_read(char *out, int maxlen)
 	raw_spin_lock_irqsave(&hackbot_con_lock, flags);
 
 	avail = (console_total < HACKBOT_CONSOLE_BUF_SIZE)
-		? console_total : HACKBOT_CONSOLE_BUF_SIZE;
+		? (unsigned int)console_total : HACKBOT_CONSOLE_BUF_SIZE;
 
 	copy_len = (avail < (unsigned int)maxlen) ? avail : (unsigned int)maxlen;
 
