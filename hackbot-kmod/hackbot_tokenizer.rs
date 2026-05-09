@@ -387,9 +387,14 @@ pub(crate) fn generate_from_tokens(
 
     reset_kv_cache(slot);
 
-    // Prefill
+    // Prefill. forward_token returns Err only when the model state is
+    // malformed (see R-025); abort generation rather than continuing with
+    // a half-filled KV cache.
     for i in 0..n_prompt {
-        forward_token(slot, prompt_tokens[i] as usize, i);
+        if forward_token(slot, prompt_tokens[i] as usize, i).is_err() {
+            pr_err!("hackbot: forward_token failed during prefill at token {}\n", i);
+            return 0;
+        }
     }
 
     // Autoregressive generation
@@ -423,7 +428,10 @@ pub(crate) fn generate_from_tokens(
         output[out_len..out_len + copy_len].copy_from_slice(&decode_buf[..copy_len]);
         out_len += copy_len;
 
-        forward_token(slot, next_token, pos);
+        if forward_token(slot, next_token, pos).is_err() {
+            pr_err!("hackbot: forward_token failed during gen at pos {}\n", pos);
+            break;
+        }
         pos += 1;
         next_token = get_next_token(slot);
     }

@@ -131,12 +131,17 @@ pub(crate) fn reset_kv_cache(slot: &ModelSlot) {
 }
 
 /// Run one token through the transformer, writing logits to inf_logits buffer.
+///
+/// Returns `Err(EINVAL)` if `slot.weights_off > slot.data_len`. That should
+/// never happen — model load enforces the invariant — but a bare subtraction
+/// here would underflow silently and the FPU side would walk past the blob.
+/// See R-025 in docs/REVIEW_v0.1.md.
 #[allow(dead_code)]
-pub(crate) fn forward_token(slot: &ModelSlot, token_id: usize, pos: usize) {
+pub(crate) fn forward_token(slot: &ModelSlot, token_id: usize, pos: usize) -> Result<()> {
     // v2: delegate to C float32 forward pass
     if slot.format_version == MODEL_FORMAT_V2 {
         let weights = (slot.data_addr + slot.weights_off) as *const core::ffi::c_void;
-        let weights_len = slot.data_len - slot.weights_off;
+        let weights_len = slot.data_len.checked_sub(slot.weights_off).ok_or(EINVAL)?;
         // SAFETY: FFI to hackbot_fpu.c. `fpu_state` was returned by
         // hackbot_fpu_alloc for this slot and is freed only on model unload
         // under MODEL.lock(). `weights` points into the model blob mapped at
@@ -154,8 +159,9 @@ pub(crate) fn forward_token(slot: &ModelSlot, token_id: usize, pos: usize) {
         if ret != 0 {
             pr_err!("hackbot: FPU forward failed: ret={} (token={}, pos={})\n",
                     ret, token_id, pos);
+            return Err(EINVAL);
         }
-        return;
+        return Ok(());
     }
 
     // v1: Q16.16 fixed-point forward pass
@@ -524,4 +530,6 @@ pub(crate) fn forward_token(slot: &ModelSlot, token_id: usize, pos: usize) {
         pr_info!("hackbot: DEBUG logits[pos=0]: top1 = token {} (logit {})\n",
                  best_i, best_v);
     }
+
+    Ok(())
 }
