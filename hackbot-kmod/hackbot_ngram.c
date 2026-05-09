@@ -283,7 +283,14 @@ void hackbot_ngram_process(const struct tokenized_event *tok)
 	WRITE_ONCE(st->last_baseline_surprise, base_surp);
 	WRITE_ONCE(st->last_adaptive_surprise, adapt_surp);
 	WRITE_ONCE(st->last_combined_surprise, combined);
-	memcpy(st->last_field_surprise, field_surp, TOK_NR_FIELDS);
+	/*
+	 * Per-field surprise snapshot: the reader uses READ_ONCE per field
+	 * for human display only, so torn reads are tolerable. Wrap the
+	 * memcpy in data_race() to silence KCSAN — same posture as the
+	 * sched/syscall-ring memcpys in hackbot_trace.c (see R-028b).
+	 * R-028 in docs/REVIEW_v0.1.md.
+	 */
+	data_race(memcpy(st->last_field_surprise, field_surp, TOK_NR_FIELDS));
 
 	/* 4. Update models — GATED LEARNING for adaptive */
 	update_model(st->baseline, &cpu->prev_token, tok);
