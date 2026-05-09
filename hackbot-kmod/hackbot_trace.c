@@ -218,8 +218,16 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 	s->sched_ring[idx].prev_pid = prev->pid;
 	s->sched_ring[idx].next_pid = next->pid;
 	s->sched_ring[idx].prev_state = prev_state;
-	memcpy(s->sched_ring[idx].prev_comm, prev->comm, 16);
-	memcpy(s->sched_ring[idx].next_comm, next->comm, 16);
+	/*
+	 * R-028b: comm is updated by set_task_comm() under task_lock + a
+	 * seqcount; reading it lock-free here can produce a torn 16-byte
+	 * value during a concurrent exec/prctl on the target task. comm is
+	 * for human display only, so torn reads are tolerated. Wrap in
+	 * data_race() to silence KCSAN. __get_task_comm() is not exported
+	 * to modules in linux-6.19; if/when it is, prefer it over this.
+	 */
+	data_race(memcpy(s->sched_ring[idx].prev_comm, prev->comm, 16));
+	data_race(memcpy(s->sched_ring[idx].next_comm, next->comm, 16));
 
 	/* Tier 2: Feature vector (per-CPU, seqcount-protected).
 	 * IRQ-disable blocks softirq re-entry from block_rq_complete on the
@@ -275,7 +283,7 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 			int slot = atomic_inc_return(&s->sched_agg.n_tasks) - 1;
 			if (slot < MAX_TRACKED_TASKS) {
 				s->sched_agg.tasks[slot].pid = next->pid;
-				memcpy(s->sched_agg.tasks[slot].comm, next->comm, 16);
+				data_race(memcpy(s->sched_agg.tasks[slot].comm, next->comm, 16));
 				atomic64_set(&s->sched_agg.tasks[slot].count, 1);
 			} else {
 				/* Lost race — another CPU took the last slot.
@@ -304,7 +312,7 @@ static void hackbot_probe_sys_enter(void *data, struct pt_regs *regs, long id)
 	s->syscall_ring[idx].cpu = raw_smp_processor_id();
 	s->syscall_ring[idx].pid = current->pid;
 	s->syscall_ring[idx].syscall_id = id;
-	memcpy(s->syscall_ring[idx].comm, current->comm, 16);
+	data_race(memcpy(s->syscall_ring[idx].comm, current->comm, 16));
 
 	/* Tier 2: Features (per-CPU, seqcount-protected). */
 	local_irq_save(flags);
