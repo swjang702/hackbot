@@ -116,7 +116,7 @@ int hackbot_kprobe_attach(const char *symbol, int len)
 	slots[free_slot].active = true;
 	mutex_unlock(&kprobe_mutex);
 
-	pr_info("hackbot: kprobe attached to '%s'\n", slots[free_slot].symbol);
+	pr_info_ratelimited("hackbot: kprobe attached to '%s'\n", slots[free_slot].symbol);
 	return 0;
 }
 
@@ -243,7 +243,7 @@ int hackbot_kprobe_detach(const char *symbol, int len)
 		if ((int)strlen(slots[i].symbol) == len &&
 		    memcmp(slots[i].symbol, symbol, len) == 0) {
 			unregister_kprobe(&slots[i].kp);
-			pr_info("hackbot: kprobe detached from '%s' (hits: %lld)\n",
+			pr_info_ratelimited("hackbot: kprobe detached from '%s' (hits: %lld)\n",
 				slots[i].symbol,
 				atomic64_read(&slots[i].count));
 			slots[i].active = false;
@@ -271,7 +271,7 @@ void hackbot_kprobe_cleanup(void)
 		if (!slots[i].active)
 			continue;
 		unregister_kprobe(&slots[i].kp);
-		pr_info("hackbot: cleanup kprobe '%s' (hits: %lld)\n",
+		pr_info_ratelimited("hackbot: cleanup kprobe '%s' (hits: %lld)\n",
 			slots[i].symbol,
 			atomic64_read(&slots[i].count));
 		slots[i].active = false;
