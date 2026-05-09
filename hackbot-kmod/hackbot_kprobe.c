@@ -68,6 +68,15 @@ int hackbot_kprobe_attach(const char *symbol, int len)
 	if (!symbol || len <= 0 || len >= MAX_SYMBOL_LEN)
 		return -EINVAL;
 
+	/*
+	 * Symbol names must not contain embedded NULs (kprobe core treats
+	 * the name as a NUL-terminated C string). Reject early — otherwise
+	 * the dedup loop would compare against a truncated stored prefix
+	 * and yield false matches/mismatches.
+	 */
+	if (memchr(symbol, '\0', len))
+		return -EINVAL;
+
 	mutex_lock(&kprobe_mutex);
 
 	/* Check for duplicate and find a free slot. */
