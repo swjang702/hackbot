@@ -6,14 +6,18 @@
  * message into a 64 KB circular buffer.  hackbot_console_read() copies
  * the most recent bytes out for the dmesg tool.
  *
- * The write callback runs in ANY context (including hardirq and NMI),
- * so we use a raw spinlock with irqsave and never sleep.
+ * The write callback runs in ANY context (including hardirq and NMI).
+ * NMI-safe via trylock + drop-on-contention; non-NMI uses the blocking
+ * raw spinlock with irqsave.  We never sleep.  The reader path runs in
+ * process context only and uses the blocking lock.
  */
 
+#include <linux/atomic.h>
 #include <linux/console.h>
+#include <linux/preempt.h>
+#include <linux/printk.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
-#include <linux/printk.h>
 #include <linux/types.h>
 #include "hackbot_console.h"
 
@@ -23,6 +27,13 @@ static char console_buf[HACKBOT_CONSOLE_BUF_SIZE];
 static unsigned int console_head;     /* next write position (circular) */
 static u64 console_total;              /* total bytes ever written */
 static DEFINE_RAW_SPINLOCK(hackbot_con_lock);
+
+/*
+ * Count of console messages dropped because an NMI hit a CPU that was
+ * already holding hackbot_con_lock (from a prior write or the reader).
+ * BSS-zero-initialized; introspection only for now.
+ */
+static atomic_t console_nmi_drops;
 
 /*
  * Console write callback.  Called by printk for every message.
@@ -47,7 +58,25 @@ static void hackbot_console_write(struct console *con, const char *s,
 		count = HACKBOT_CONSOLE_BUF_SIZE;
 	}
 
-	raw_spin_lock_irqsave(&hackbot_con_lock, flags);
+	/*
+	 * NMI may fire on a CPU that already holds hackbot_con_lock
+	 * (we were mid-write or the reader was running).  Blocking on
+	 * a raw spinlock from NMI context against the same CPU wedges
+	 * forever — printk dispatches to all consoles, and the NMI
+	 * watchdog itself printk's when it detects a hard lockup.
+	 *
+	 * NMI: trylock, drop the message on contention.
+	 * Non-NMI: regular blocking acquire.  Hardirqs are masked by
+	 * _irqsave; only NMI can preempt the same CPU mid-lock.
+	 */
+	if (in_nmi()) {
+		if (!raw_spin_trylock_irqsave(&hackbot_con_lock, flags)) {
+			atomic_inc(&console_nmi_drops);
+			return;
+		}
+	} else {
+		raw_spin_lock_irqsave(&hackbot_con_lock, flags);
+	}
 
 	/* Bytes until end of buffer (before wrap). */
 	first = HACKBOT_CONSOLE_BUF_SIZE - console_head;
