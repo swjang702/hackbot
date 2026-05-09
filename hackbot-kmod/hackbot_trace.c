@@ -984,6 +984,24 @@ fail:
 	return ret;
 }
 
+/*
+ * Reader/writer lifecycle invariants for trace_state (`s`):
+ *
+ *   1. Probe-context readers (hackbot_probe_*): drained by
+ *      tracepoint_synchronize_unregister() below, which waits for all
+ *      in-flight callbacks on every CPU to return before we proceed
+ *      to free `s`.
+ *
+ *   2. Misc-device-context readers (hackbot_trace_read_* called from
+ *      <tool>trace ...</tool> via the agent's write_iter path): gated
+ *      by the misc device's file refcount. An in-flight write_iter
+ *      syscall holds an fdget ref on the file, which holds a module
+ *      ref via fops->owner = THIS_MODULE; rmmod cannot run while that
+ *      ref is held, so this exit function cannot run concurrently
+ *      with a reader. No internal synchronize is required for path 2.
+ *
+ * Both invariants must hold before the kvfree/kfree calls at the end.
+ */
 void hackbot_trace_exit(void)
 {
 	struct hackbot_trace_state *s = trace_state;

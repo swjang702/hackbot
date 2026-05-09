@@ -126,7 +126,7 @@ Sorted by file. Severity then ID within each file. `[V]` = directly verified.
 | R-013 | hackbot_tools.rs:117,167-209 | P1 | Sleeping `KVVec::push(GFP_KERNEL)` under `rcu::read_lock()` | [V] |
 | R-003 | hackbot_tokenizer.c:458-479 | P1 | `pr_info` from inside `sched_switch` / `sys_enter` / `block_rq_complete` | [A] |
 | R-021b | hackbot_tokenizer.rs (debug `pr_info!`) | P2 | DEBUG logs in inference hot path | [A] |
-| R-004 | hackbot_trace.c (no `tracepoint_synchronize_unregister`) | P1 | In-flight probes can run after struct free | [A] |
+| R-004 | hackbot_trace.c (no `tracepoint_synchronize_unregister`) | ~~P1~~ | False alarm — already implemented at hackbot_trace.c:1006 | [V] |
 | R-023 | hackbot_vllm.rs:81,86 | P2 | `-(e.to_errno())` overflow on `i32::MIN` | [A] |
 | R-030 | test.sh (entire file) | P1 | No `dmesg` grep for `BUG:` / `KASAN:` / `KCSAN:` markers | [A] |
 | R-031 | Makefile:67-69 | P1 | `check-kconfig` checks parent options only | [A] |
@@ -233,20 +233,40 @@ agent thinks tracing is fully online when only one channel is.
 `hackbot_trace_active_channels()` accessor that the agent and the
 status path can query.
 
-#### R-004 — `tracepoint_synchronize_unregister()` not called before `kfree` [P1 A]
+#### R-004 — `tracepoint_synchronize_unregister()` not called before `kfree` [~~P1~~ — false alarm, closed without code change]
 
 **file:** `hackbot_trace.c` (exit path, file-wide)
 
-**What.** After unregistering tracepoint probes, the kernel does not
-guarantee that in-flight probes have completed. The required pairing
-is `tracepoint_probe_unregister(...)` then
-`tracepoint_synchronize_unregister()` then free.
+**Status (2026-05-09):** **False alarm.** Audit confirmed
+`tracepoint_synchronize_unregister();` is already called at
+`hackbot_trace.c:1006`, between the probe-unregister loop and the
+`hackbot_ngram_exit()` / `hackbot_tokenizer_exit()` / `kvfree(s->...)`
+/ `kfree(s)` calls. The original C-paths review agent missed it.
 
-**Why.** Without the synchronize, a probe currently running on another
-CPU can still touch the structures we just freed.
+The misc-device-context reader UAF this finding could plausibly have
+covered (`hackbot_trace_read_*` racing `kvfree` from another CPU) is
+also closed today: misc-device fd refcounting holds the file ref
+through any in-flight `write_iter`, which holds a module ref, which
+prevents `rmmod` from running. The `s->active` check in reader paths
+is defensive; the real safety property is the fd refcount.
 
-**Fix.** Add `tracepoint_synchronize_unregister()` between the
-unregister loop and any `kfree` / `kvfree` of state.
+A hardening comment was added above `hackbot_trace_exit` documenting
+this dual reader-drain story (probe context drained by
+`tracepoint_synchronize_unregister`; misc-device context drained by
+fd refcounting). No structural code change in this round.
+
+Original (now-superseded) text retained for reference:
+
+> **Original What.** After unregistering tracepoint probes, the kernel
+> does not guarantee that in-flight probes have completed. The required
+> pairing is `tracepoint_probe_unregister(...)` then
+> `tracepoint_synchronize_unregister()` then free.
+>
+> **Original Why.** Without the synchronize, a probe currently running
+> on another CPU can still touch the structures we just freed.
+>
+> **Original Fix.** Add `tracepoint_synchronize_unregister()` between
+> the unregister loop and any `kfree` / `kvfree` of state.
 
 #### R-028b — Torn 16-byte memcpy of `task->comm` [P2 A]
 
