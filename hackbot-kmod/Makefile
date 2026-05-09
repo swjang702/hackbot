@@ -121,13 +121,23 @@ unload:
 	sudo rmmod hackbot
 	@echo "hackbot: module unloaded"
 
-test: load
-	@echo "--- Writing prompt ---"
-	echo "hello from userspace" > /dev/hackbot
-	@echo "--- Reading response ---"
-	cat /dev/hackbot
-	@echo "--- Done ---"
-	$(MAKE) unload
+# Idempotent smoke test: unloads any stale module first, loads fresh, runs
+# write/read, and uses an EXIT trap to guarantee unload on success, failure,
+# or signal. set -e fails fast on any step.
+test:
+	@bash -euo pipefail -c '\
+		if lsmod | grep -q "^hackbot "; then \
+			echo "hackbot already loaded; unloading first"; \
+			sudo rmmod hackbot; \
+		fi; \
+		sudo insmod hackbot.ko; \
+		trap "sudo rmmod hackbot 2>/dev/null || true" EXIT; \
+		echo "--- Writing prompt ---"; \
+		echo "hello from userspace" > /dev/hackbot; \
+		echo "--- Reading response ---"; \
+		cat /dev/hackbot; \
+		echo "--- Done ---"; \
+	'
 
 test-full:
 	sudo bash test.sh full
