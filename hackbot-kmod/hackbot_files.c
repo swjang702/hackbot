@@ -249,6 +249,14 @@ int hackbot_list_fds(int pid, char *out, int maxlen)
 		tlen = snprintf(trunc_msg, sizeof(trunc_msg),
 				"[... truncated, showing %d of %d fds]\n",
 				count, total_fds);
+		/*
+		 * snprintf returns the would-have-been length when the output
+		 * is truncated, NOT the bytes actually written. Passing that
+		 * unclamped to append_str would read past the NUL into
+		 * uninitialised stack bytes (R-026 in docs/REVIEW_v0.1.md).
+		 */
+		if (tlen >= (int)sizeof(trunc_msg))
+			tlen = (int)sizeof(trunc_msg) - 1;
 		if (pos >= 0 && tlen > 0)
 			pos = append_str(out, pos, maxlen, trunc_msg, tlen);
 	}
