@@ -65,6 +65,32 @@ dmesg_since() {
     dmesg | tail -n "+$((DMESG_MARKER + 1))" | grep -q "$1" 2>/dev/null
 }
 
+# Fail the test if dmesg since the given absolute line number contains
+# any sanitizer or fatal-fault marker. The starting line is passed in
+# explicitly so the scan span is independent of DMESG_MARKER, which
+# show_dmesg() advances. Returns 0 if clean, 1 if a marker matched
+# (and the caller should skip its concluding pass).
+#
+# The pattern set is curated to UNAMBIGUOUS fault markers — we
+# deliberately avoid bare "WARNING:" or bare "Call Trace:" because
+# those fire on benign kernel paths unrelated to hackbot.
+check_no_kernel_errors() {
+    local label="$1"
+    local from_line="$2"
+    local matches
+    matches=$(dmesg | tail -n "+$((from_line + 1))" | \
+        grep -E '(BUG:|Oops:|Kernel panic|general protection fault|unable to handle (kernel )?(paging request|page fault)|KASAN:|UBSAN:|KCSAN:|KFENCE:|scheduling while atomic|sleeping function called from invalid context|WARNING: possible (circular|recursive) locking|WARNING: possible irq lock inversion|WARNING: held lock freed|WARNING: bad unlock balance|INFO: trying to register non-static key|lockdep:|RCU stall|rcu_sched detected stalls)' \
+        || true)
+    if [[ -n "$matches" ]]; then
+        fail "$label: kernel error detected in dmesg"
+        log "--- dmesg fault markers ---"
+        echo "$matches" | while IFS= read -r line; do log "$line"; done
+        log "--- end dmesg fault markers ---"
+        return 1
+    fi
+    return 0
+}
+
 # Ensure module is unloaded on exit
 cleanup() {
     if is_loaded; then
@@ -156,6 +182,7 @@ test_lifecycle() {
     echo ""
     echo "=== Module Lifecycle ==="
     mark_dmesg
+    local lifecycle_start=$DMESG_MARKER
 
     # Load
     info "Loading hackbot.ko..."
@@ -226,6 +253,9 @@ test_lifecycle() {
         fail "Module failed to reload"
         show_dmesg
     fi
+
+    if ! check_no_kernel_errors "lifecycle" "$lifecycle_start"; then return; fi
+    pass "lifecycle: no kernel errors in dmesg"
 }
 
 # ---------------------------------------------------------------------------
@@ -236,6 +266,7 @@ test_basic_io() {
     echo ""
     echo "=== Basic I/O ==="
     mark_dmesg
+    local basic_io_start=$DMESG_MARKER
 
     ensure_loaded || return
     sleep 2
@@ -254,6 +285,9 @@ test_basic_io() {
     show_dmesg
     rmmod hackbot 2>/dev/null || true
     sleep 1
+
+    if ! check_no_kernel_errors "basic_io" "$basic_io_start"; then return; fi
+    pass "basic_io: no kernel errors in dmesg"
 }
 
 # ---------------------------------------------------------------------------
@@ -284,6 +318,7 @@ test_tools() {
     echo ""
     echo "=== Tool Tests (via vLLM) ==="
     mark_dmesg
+    local tools_start=$DMESG_MARKER
 
     ensure_loaded || return
     sleep 2
@@ -311,6 +346,9 @@ test_tools() {
     show_dmesg
     rmmod hackbot 2>/dev/null || true
     sleep 1
+
+    if ! check_no_kernel_errors "tools" "$tools_start"; then return; fi
+    pass "tools: no kernel errors in dmesg"
 }
 
 # ---------------------------------------------------------------------------
@@ -321,6 +359,7 @@ test_patrol() {
     echo ""
     echo "=== Patrol Thread ==="
     mark_dmesg
+    local patrol_start=$DMESG_MARKER
 
     ensure_loaded || return
     sleep 2
@@ -360,6 +399,9 @@ test_patrol() {
     rmmod hackbot 2>/dev/null || true
     sleep 1
     show_dmesg
+
+    if ! check_no_kernel_errors "patrol" "$patrol_start"; then return; fi
+    pass "patrol: no kernel errors in dmesg"
 }
 
 # ---------------------------------------------------------------------------
@@ -370,6 +412,7 @@ test_memory() {
     echo ""
     echo "=== Agent Memory ==="
     mark_dmesg
+    local memory_start=$DMESG_MARKER
 
     ensure_loaded || return
     sleep 2
@@ -401,6 +444,9 @@ test_memory() {
     show_dmesg
     rmmod hackbot 2>/dev/null || true
     sleep 1
+
+    if ! check_no_kernel_errors "memory" "$memory_start"; then return; fi
+    pass "memory: no kernel errors in dmesg"
 }
 
 # ---------------------------------------------------------------------------
