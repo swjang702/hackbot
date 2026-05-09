@@ -46,9 +46,6 @@
 /* Baseline model halves every N events to prevent u32 overflow (~55min) */
 #define NGRAM_BASELINE_HALVE_INTERVAL  10000000
 
-/* Number of debug surprise prints to dmesg on startup */
-#define NGRAM_DEBUG_PRINTS     20
-
 /* --- Anomaly detection thresholds --- */
 
 /* Surprise below this = "expected" (used for classification) */

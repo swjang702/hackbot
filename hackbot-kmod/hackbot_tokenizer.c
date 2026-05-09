@@ -431,15 +431,10 @@ static inline const char *safe_field_name(const char * const *names,
  * Must be called with preemption disabled.
  * =================================================================== */
 
-/* Debug: log first N tokens to dmesg for verification */
-#define TOKEN_DEBUG_PRINTS 10
-static atomic_t token_debug_count = ATOMIC_INIT(0);
-
 static inline void store_token(const struct tokenized_event *tok, u64 now_ns)
 {
 	struct hackbot_tok_cpu *cpu_state = this_cpu_ptr(&hackbot_tok_percpu);
 	int idx;
-	long long count;
 
 	/* Update per-CPU state */
 	cpu_state->last_token = *tok;
@@ -452,31 +447,7 @@ static inline void store_token(const struct tokenized_event *tok, u64 now_ns)
 	token_ring[idx].cpu = raw_smp_processor_id();
 	token_ring[idx].pid = current->pid;
 
-	count = atomic64_inc_return(&token_total_count);
-
-	/* Print first few tokens to dmesg for debugging/verification */
-	if (atomic_inc_return(&token_debug_count) <= TOKEN_DEBUG_PRINTS) {
-		pr_info("hackbot: token[%lld]: [%s,%s,%s,%s,%s,%s,%s,%s] "
-			"cpu=%u pid=%d\n",
-			count - 1,
-			safe_field_name(cat_names, NR_CATEGORIES,
-					tok->fields[TOK_FIELD_CATEGORY]),
-			safe_field_name(act_names, NR_ACTIONS,
-					tok->fields[TOK_FIELD_ACTION]),
-			safe_field_name(obj_names, NR_OBJ_TYPES,
-					tok->fields[TOK_FIELD_OBJ_TYPE]),
-			safe_field_name(tgt_names, NR_TGT_CLASSES,
-					tok->fields[TOK_FIELD_TARGET]),
-			safe_field_name(size_names, NR_SIZE_CLASSES,
-					tok->fields[TOK_FIELD_SIZE]),
-			safe_field_name(ret_names, NR_RET_CLASSES,
-					tok->fields[TOK_FIELD_RESULT]),
-			safe_field_name(dur_names, NR_DUR_CLASSES,
-					tok->fields[TOK_FIELD_DURATION]),
-			safe_field_name(gap_names, NR_GAP_CLASSES,
-					tok->fields[TOK_FIELD_GAP]),
-			raw_smp_processor_id(), current->pid);
-	}
+	atomic64_inc(&token_total_count);
 }
 
 /* ===================================================================

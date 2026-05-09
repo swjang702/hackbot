@@ -34,8 +34,6 @@ static struct ngram_state *ngram;
 
 static DEFINE_PER_CPU(struct ngram_cpu_state, ngram_percpu);
 
-static atomic_t ngram_debug_count = ATOMIC_INIT(0);
-
 /* Classification names for output */
 static const char * const class_names[] = {
 	"NORMAL", "ANOMALY", "DRIFT", "REGRESSION", "UNCERTAIN"
@@ -201,9 +199,7 @@ void hackbot_ngram_process(const struct tokenized_event *tok)
 	u32 base_surp, adapt_surp, combined;
 	u8 field_surp[TOK_NR_FIELDS];
 	u8 classification;
-	long long count;
 	u64 now_ns, elapsed_ns;
-	int dbg;
 
 	if (unlikely(!st || !st->active))
 		return;
@@ -254,22 +250,8 @@ void hackbot_ngram_process(const struct tokenized_event *tok)
 	}
 
 	/* 6. Update counters and save prev */
-	count = atomic64_inc_return(&st->event_count);
+	atomic64_inc(&st->event_count);
 	cpu->prev_token = *tok;
-
-	/* 7. Debug prints */
-	dbg = atomic_inc_return(&ngram_debug_count);
-	if (dbg <= NGRAM_DEBUG_PRINTS) {
-		pr_info("hackbot: ngram[%lld]: %s surprise base=%u adapt=%u "
-			"fields=[%u,%u,%u,%u,%u,%u,%u,%u]\n",
-			count - 1,
-			class_names[classification],
-			base_surp, adapt_surp,
-			field_surp[0], field_surp[1],
-			field_surp[2], field_surp[3],
-			field_surp[4], field_surp[5],
-			field_surp[6], field_surp[7]);
-	}
 }
 
 /* ===================================================================
@@ -641,7 +623,6 @@ int hackbot_ngram_init(void)
 	}
 
 	atomic64_set(&st->event_count, 0);
-	atomic_set(&ngram_debug_count, 0);
 
 	st->active = true;
 	ngram = st;
