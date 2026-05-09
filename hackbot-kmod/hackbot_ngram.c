@@ -24,6 +24,7 @@
 #include <linux/timekeeping.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include "hackbot_ngram.h"
 
 /* ===================================================================
@@ -51,10 +52,17 @@ static const char * const field_labels[TOK_NR_FIELDS] = {
 static inline u32 compute_field_surprise(const struct ngram_field_table *ft,
 					 u8 prev_val, u8 curr_val)
 {
+	int rt_s, ct_s;
 	u32 rt, ct;
 
-	rt = READ_ONCE(ft->row_total[prev_val]);
-	ct = READ_ONCE(ft->count[prev_val][curr_val]);
+	rt_s = atomic_read(&ft->row_total[prev_val]);
+	ct_s = atomic_read(&ft->count[prev_val][curr_val]);
+
+	/* atomic_t is signed int; values are non-negative by construction
+	 * (only inc / >>=1), but clamp to be safe against any transient
+	 * tear in pre-x86 archs. */
+	rt = (rt_s < 0) ? 0 : (u32)rt_s;
+	ct = (ct_s < 0) ? 0 : (u32)ct_s;
 
 	if (ct == 0 || rt == 0)
 		return NGRAM_MAX_SURPRISE;
@@ -105,7 +113,45 @@ static inline u8 classify_surprise(u32 base_surp, u32 adapt_surp)
 }
 
 /* ===================================================================
+ * Halving — runs in workqueue context (process context, can sleep
+ * briefly). Lossy by design: a concurrent atomic_inc between our
+ * atomic_read and atomic_set may be silently undone. Bounded loss
+ * is at most one increment per cell per cycle — epsilon noise vs.
+ * the ~10K-event halve interval.
+ * =================================================================== */
+
+static void halve_work_fn(struct work_struct *work)
+{
+	struct ngram_model *m = container_of(work, struct ngram_model,
+					     halve_work);
+	int f, i, j;
+
+	for (f = 0; f < TOK_NR_FIELDS; f++) {
+		struct ngram_field_table *ft = &m->fields[f];
+
+		for (i = 0; i < NGRAM_DIM; i++) {
+			for (j = 0; j < NGRAM_DIM; j++) {
+				int v = atomic_read(&ft->count[i][j]);
+				if (v > 0)
+					atomic_set(&ft->count[i][j], v >> 1);
+			}
+			{
+				int v = atomic_read(&ft->row_total[i]);
+				if (v > 0)
+					atomic_set(&ft->row_total[i], v >> 1);
+			}
+		}
+	}
+	atomic_inc(&m->halve_count);
+}
+
+/* ===================================================================
  * Model update — Hogwild increment
+ *
+ * R-005: atomic_inc on count cells and row totals. total_events is
+ * atomic64_t. Halving is offloaded to a workqueue and gated by an
+ * atomic64_cmpxchg election so exactly one CPU schedules the work
+ * per threshold-crossing.
  * =================================================================== */
 
 static inline void update_model(struct ngram_model *m,
@@ -113,37 +159,36 @@ static inline void update_model(struct ngram_model *m,
 				const struct tokenized_event *curr)
 {
 	int f;
-	u32 ct, rt;
+	u64 cur, threshold;
 
 	for (f = 0; f < TOK_NR_FIELDS; f++) {
 		u8 p = prev->fields[f];
 		u8 c = curr->fields[f];
 		struct ngram_field_table *ft = &m->fields[f];
 
-		ct = READ_ONCE(ft->count[p][c]);
-		if (likely(ct < 0x7FFFFFFFU))
-			WRITE_ONCE(ft->count[p][c], ct + 1);
-
-		rt = READ_ONCE(ft->row_total[p]);
-		if (likely(rt < 0x7FFFFFFFU))
-			WRITE_ONCE(ft->row_total[p], rt + 1);
+		atomic_inc(&ft->count[p][c]);
+		atomic_inc(&ft->row_total[p]);
 	}
 
-	m->total_events++;
+	cur = (u64)atomic64_inc_return(&m->total_events);
 
-	if (m->halve_interval > 0 &&
-	    m->total_events % m->halve_interval == 0) {
-		int i, j;
+	if (m->halve_interval == 0)
+		return;
 
-		for (f = 0; f < TOK_NR_FIELDS; f++) {
-			struct ngram_field_table *ft = &m->fields[f];
-			for (i = 0; i < NGRAM_DIM; i++) {
-				for (j = 0; j < NGRAM_DIM; j++)
-					ft->count[i][j] >>= 1;
-				ft->row_total[i] >>= 1;
-			}
-		}
-		m->halve_count++;
+	threshold = (u64)atomic64_read(&m->next_halve_at);
+	if (cur >= threshold &&
+	    (u64)atomic64_cmpxchg(&m->next_halve_at,
+				  (s64)threshold,
+				  (s64)(threshold + m->halve_interval))
+	    == threshold) {
+		/* schedule_work is safe from preempt-disabled tracepoint
+		 * context (lock-free fast path). If the worker is still
+		 * running from a previous scheduling, schedule_work is
+		 * idempotent and our cmpxchg election still elected a
+		 * single winner — counts may grow up to ~2x expected
+		 * before the next halving lands; still well below
+		 * INT_MAX with halve_interval <= 10M. */
+		schedule_work(&m->halve_work);
 	}
 }
 
@@ -436,16 +481,18 @@ int hackbot_ngram_read_stats(char *out, int maxlen)
 
 	pos = ng_append_str(out, pos, maxlen, "Adaptive: events=");
 	pos = ng_append_num(out, pos, maxlen,
-			    (long long)st->adaptive->total_events);
+			    atomic64_read(&st->adaptive->total_events));
 	pos = ng_append_str(out, pos, maxlen, " halves=");
-	pos = ng_append_num(out, pos, maxlen, st->adaptive->halve_count);
+	pos = ng_append_num(out, pos, maxlen,
+			    atomic_read(&st->adaptive->halve_count));
 	pos = ng_append_str(out, pos, maxlen, "\n");
 
 	pos = ng_append_str(out, pos, maxlen, "Baseline: events=");
 	pos = ng_append_num(out, pos, maxlen,
-			    (long long)st->baseline->total_events);
+			    atomic64_read(&st->baseline->total_events));
 	pos = ng_append_str(out, pos, maxlen, " halves=");
-	pos = ng_append_num(out, pos, maxlen, st->baseline->halve_count);
+	pos = ng_append_num(out, pos, maxlen,
+			    atomic_read(&st->baseline->halve_count));
 	pos = ng_append_str(out, pos, maxlen, "\n");
 
 	if (uptime_s > 0) {
@@ -469,13 +516,17 @@ int hackbot_ngram_read_stats(char *out, int maxlen)
 		max_count = 0;
 		max_total = 0;
 		for (i = 0; i < NGRAM_DIM; i++) {
-			if (ft->row_total[i] > max_total)
-				max_total = ft->row_total[i];
+			int rt_v = atomic_read(&ft->row_total[i]);
+			u32 rt_u = (rt_v < 0) ? 0 : (u32)rt_v;
+			if (rt_u > max_total)
+				max_total = rt_u;
 			for (j = 0; j < NGRAM_DIM; j++) {
-				if (ft->count[i][j] > 0)
+				int ct_v = atomic_read(&ft->count[i][j]);
+				u32 ct_u = (ct_v < 0) ? 0 : (u32)ct_v;
+				if (ct_u > 0)
 					nonzero++;
-				if (ft->count[i][j] > max_count)
-					max_count = ft->count[i][j];
+				if (ct_u > max_count)
+					max_count = ct_u;
 			}
 		}
 		pos = ng_append_str(out, pos, maxlen, "  ");
@@ -605,6 +656,19 @@ int hackbot_ngram_init(void)
 
 	st->baseline->halve_interval = NGRAM_BASELINE_HALVE_INTERVAL;
 	st->adaptive->halve_interval = NGRAM_ADAPTIVE_HALVE_INTERVAL;
+
+	/* R-005: init atomic counters and the halving workqueue work.
+	 * kvzalloc above already zeroed the count[][] / row_total[]
+	 * atomic_t fields (representation is `int` with value 0). */
+	atomic64_set(&st->baseline->total_events, 0);
+	atomic64_set(&st->adaptive->total_events, 0);
+	atomic64_set(&st->baseline->next_halve_at, NGRAM_BASELINE_HALVE_INTERVAL);
+	atomic64_set(&st->adaptive->next_halve_at, NGRAM_ADAPTIVE_HALVE_INTERVAL);
+	atomic_set(&st->baseline->halve_count, 0);
+	atomic_set(&st->adaptive->halve_count, 0);
+	INIT_WORK(&st->baseline->halve_work, halve_work_fn);
+	INIT_WORK(&st->adaptive->halve_work, halve_work_fn);
+
 	st->init_ns = ktime_get_raw_fast_ns();
 
 	/* Initialize alert system */
@@ -668,9 +732,20 @@ void hackbot_ngram_exit(void)
 		atomic64_read(&st->alert_count),
 		atomic64_read(&st->suppressed_count),
 		atomic64_read(&st->gated_count),
-		st->adaptive->halve_count,
+		atomic_read(&st->adaptive->halve_count),
 		READ_ONCE(st->last_baseline_surprise),
 		READ_ONCE(st->last_adaptive_surprise));
+
+	/*
+	 * R-005: drain any in-flight or queued halve work before freeing
+	 * the model memory. Implicit precondition: hackbot_trace_exit() has
+	 * already unregister'd the tracepoints and called
+	 * tracepoint_synchronize_unregister(), so no fresh schedule_work()
+	 * can land while we cancel. (R-004 follow-up tightens this contract
+	 * but is not in scope here.)
+	 */
+	cancel_work_sync(&st->baseline->halve_work);
+	cancel_work_sync(&st->adaptive->halve_work);
 
 	kvfree(st->alert_ring);
 	kvfree(st->baseline);

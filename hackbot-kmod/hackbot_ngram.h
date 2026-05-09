@@ -28,6 +28,7 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/workqueue.h>
 #include "hackbot_tokenizer.h"
 
 /* ===================================================================
@@ -104,15 +105,22 @@ struct ngram_alert {
  * =================================================================== */
 
 struct ngram_field_table {
-	u32 count[NGRAM_DIM][NGRAM_DIM];
-	u32 row_total[NGRAM_DIM];
+	/* R-005: atomic_t makes increments and halving KCSAN-clean.
+	 * 32-bit signed; bounded above by halve_interval (10M baseline,
+	 * 10K adaptive) per cycle, far below INT_MAX. */
+	atomic_t count[NGRAM_DIM][NGRAM_DIM];
+	atomic_t row_total[NGRAM_DIM];
 };
 
 struct ngram_model {
 	struct ngram_field_table fields[TOK_NR_FIELDS];
 	u32 halve_interval;
-	u32 halve_count;
-	u64 total_events;
+	atomic_t halve_count;
+	atomic64_t total_events;
+	/* Threshold-crossing election for halving. The single CPU that
+	 * cmpxchgs this value forward queues halve_work; others move on. */
+	atomic64_t next_halve_at;
+	struct work_struct halve_work;
 };
 
 struct ngram_state {
