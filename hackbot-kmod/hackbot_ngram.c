@@ -33,6 +33,16 @@
 
 static struct ngram_state *ngram;
 
+/*
+ * R-012: alert wait queue at module (static) lifetime; outlives
+ * struct ngram_state. Wakers must check the `ngram` pointer for NULL
+ * after wakeup before dereferencing it (publish-NULL contract: see
+ * hackbot_ngram_exit's WRITE_ONCE(ngram, NULL) + smp_wmb() before the
+ * final wake_up_all, and the READ_ONCE check in
+ * hackbot_ngram_wait_or_timeout). Today only the patrol kthread waits.
+ */
+static DECLARE_WAIT_QUEUE_HEAD(hackbot_ngram_alert_wq);
+
 static DEFINE_PER_CPU(struct ngram_cpu_state, ngram_percpu);
 
 /* Classification names for output */
@@ -229,8 +239,8 @@ static void generate_alert(struct ngram_state *st,
 	atomic64_inc(&st->alert_count);
 	atomic_inc(&st->alert_pending);
 
-	/* Wake patrol thread */
-	wake_up(&st->alert_wq);
+	/* Wake patrol thread (static wq; see hackbot_ngram_alert_wq above) */
+	wake_up(&hackbot_ngram_alert_wq);
 }
 
 /* ===================================================================
@@ -310,7 +320,16 @@ long hackbot_ngram_wait_or_timeout(long timeout_jiffies)
 	if (!st || !st->active)
 		return schedule_timeout_interruptible(timeout_jiffies);
 
-	return wait_event_interruptible_timeout(st->alert_wq,
+	/*
+	 * R-012: wait on the module-static hackbot_ngram_alert_wq, not on
+	 * a field of *st. The condition still reads through `st`, but `st`
+	 * is the snapshot taken above; any writer that proceeds with
+	 * teardown will WRITE_ONCE(ngram, NULL) and then wake_up_all on
+	 * the static wq, so a stale waiter wakes, the timeout path returns,
+	 * and the caller (patrol kthread) is then kthread_stop'd by the
+	 * device exit path before *this* `st` is freed.
+	 */
+	return wait_event_interruptible_timeout(hackbot_ngram_alert_wq,
 		atomic_read(&st->alert_pending) > 0,
 		timeout_jiffies);
 }
@@ -671,8 +690,9 @@ int hackbot_ngram_init(void)
 
 	st->init_ns = ktime_get_raw_fast_ns();
 
-	/* Initialize alert system */
-	init_waitqueue_head(&st->alert_wq);
+	/* Initialize alert system. The wait queue itself is the
+	 * module-static hackbot_ngram_alert_wq (see R-012); no runtime
+	 * init needed here. */
 	atomic_set(&st->alert_ring_head, -1);
 	atomic64_set(&st->alert_count, 0);
 	atomic64_set(&st->suppressed_count, 0);
@@ -721,8 +741,10 @@ void hackbot_ngram_exit(void)
 	WRITE_ONCE(ngram, NULL);
 	smp_wmb();
 
-	/* Wake anyone waiting on alerts so they can exit */
-	wake_up_all(&st->alert_wq);
+	/* Wake anyone waiting on alerts so they can exit. Wait queue is
+	 * the module-static hackbot_ngram_alert_wq, so this is safe even
+	 * if a waiter races with teardown — the wq storage outlives `st`. */
+	wake_up_all(&hackbot_ngram_alert_wq);
 
 	pr_info("hackbot: ngram: shutdown (%lld events, "
 		"%lld alerts, %lld suppressed, %lld gated, "

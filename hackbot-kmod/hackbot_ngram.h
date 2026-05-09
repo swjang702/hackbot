@@ -26,7 +26,6 @@
  */
 
 #include <linux/types.h>
-#include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/workqueue.h>
 #include "hackbot_tokenizer.h"
@@ -144,7 +143,9 @@ struct ngram_state {
 	atomic64_t alert_count;            /* total alerts generated */
 	atomic64_t suppressed_count;       /* alerts suppressed (grace/cooldown) */
 	atomic64_t gated_count;            /* events where learning was skipped */
-	wait_queue_head_t alert_wq;        /* wakes patrol on alert */
+	/* R-012: alert wait queue lives at module scope
+	 * (hackbot_ngram_alert_wq in hackbot_ngram.c), not in this struct,
+	 * so its lifetime is independent of struct ngram_state. */
 	atomic_t alert_pending;            /* >0 means unread alerts */
 	u64 last_alert_ns;                 /* debounce: last alert timestamp */
 };
