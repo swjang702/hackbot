@@ -1,7 +1,12 @@
 # hackbot — Detailed File Index
 
-> Last updated: 2026-03-27
+> Last updated: 2026-05-09
 > Lists all public types, functions, and their signatures.
+>
+> Note: this snapshot is partial for hackbot-kmod — `hackbot_patrol.c`, `hackbot_memory.rs`,
+> `hackbot_trace.c`, `hackbot_tokenizer.{c,h}`, and `hackbot_ngram.{c,h}`, plus the newer
+> tool `tools/verify_fp16_forward.py`, are tracked in `general_index.md` but not yet
+> expanded here. Run `/update_codebase_context` to regenerate the full detail.
 
 ---
 
