@@ -78,15 +78,18 @@ pub(crate) fn process_prompt(prompt: &[u8]) -> KVVec<u8> {
             let mut r = KVVec::new();
             let _ = r.extend_from_slice(b"[hackbot] Inference error: ", GFP_KERNEL);
             let mut code_buf = [0u8; 20];
-            let code = -(e.to_errno() as isize) as usize;
+            // `unsigned_abs` avoids the panic that `-(i32::MIN)` triggers
+            // in debug builds (see R-023). Real errno values stay within
+            // -1..-4095, so the result fits in u32 trivially.
+            let code = e.to_errno().unsigned_abs() as usize;
             let code_str = format_usize(code, &mut code_buf);
             let _ = r.extend_from_slice(code_str, GFP_KERNEL);
             let _ = r.extend_from_slice(b" (errno)\n", GFP_KERNEL);
 
-            let hint = match -(e.to_errno()) {
-                19 => b"No model loaded and no vLLM available.\n" as &[u8],
-                111 => b"Connection refused - is vLLM running on port 8000?\n",
-                110 => b"Connection timed out - check network/firewall.\n",
+            let hint = match e.to_errno() {
+                -19 => b"No model loaded and no vLLM available.\n" as &[u8],   // ENODEV
+                -111 => b"Connection refused - is vLLM running on port 8000?\n", // ECONNREFUSED
+                -110 => b"Connection timed out - check network/firewall.\n",     // ETIMEDOUT
                 _ => b"",
             };
             if !hint.is_empty() {
