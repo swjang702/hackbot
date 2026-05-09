@@ -2,9 +2,11 @@
 /*
  * hackbot_files.c — List open file descriptors for a given process.
  *
- * Finds the task by PID, walks its fdtable under RCU + file_lock,
- * collects file references, drops all locks, then uses d_path()
- * to resolve each open file descriptor to a human-readable path.
+ * Finds the task by PID, pins the task via get_task_struct, then
+ * walks its fdtable under task_lock + file_lock (the canonical
+ * pattern used by fget_task in fs/file.c), collects file
+ * references, drops all locks, then uses d_path() to resolve each
+ * open file descriptor to a human-readable path.
  *
  * d_path() can take sleeping locks (e.g., on some filesystems),
  * so it must NOT be called under spinlock or RCU read lock.
@@ -100,6 +102,7 @@ int hackbot_list_fds(int pid, char *out, int maxlen)
 	char *path_buf;
 	char *path;
 	unsigned int fd;
+	unsigned int max_scan;
 	int pos = 0;
 	int count = 0;
 	int total_fds = 0;
@@ -126,16 +129,26 @@ int hackbot_list_fds(int pid, char *out, int maxlen)
 		goto out_free;
 
 	/*
-	 * Phase 1: Collect file references under RCU + file_lock.
+	 * Phase 1: Collect file references under task_lock + file_lock.
 	 *
-	 * We use get_file() to take a reference on each open file,
-	 * so the file object survives after we drop the locks.
-	 * This allows us to call d_path() later without holding
-	 * any locks — critical because d_path() can sleep.
+	 * Lifecycle (R-010): files_cachep is NOT SLAB_TYPESAFE_BY_RCU and
+	 * neither put_files_struct nor get_files_struct is exported, so we
+	 * cannot take an extra ref on files_struct ourselves. Instead, pin
+	 * the task_struct via get_task_struct, then take task_lock to
+	 * serialize against exit_files() (fs/file.c: task_lock; tsk->files
+	 * = NULL; task_unlock; put_files_struct). While task_lock is held,
+	 * task->files is stable and the underlying files_struct cannot be
+	 * freed. This mirrors the kernel's own fget_task (fs/file.c:1117).
+	 *
+	 * Lock ordering: task_lock -> file_lock. Verified against
+	 * fs/file.c and kernel/exit.c — no path takes file_lock then
+	 * nests task_lock, so there is no AB-BA.
+	 *
+	 * We use get_file() to take a reference on each open file so the
+	 * file object survives after we drop the locks; d_path() can sleep
+	 * and must NOT be called under spinlock or RCU read-side.
 	 */
 	rcu_read_lock();
-
-	/* Find the task by PID. */
 	task = pid_task(find_vpid(pid), PIDTYPE_PID);
 	if (!task) {
 		rcu_read_unlock();
@@ -143,11 +156,14 @@ int hackbot_list_fds(int pid, char *out, int maxlen)
 		kfree(path_buf);
 		return -ESRCH;
 	}
+	get_task_struct(task);
+	rcu_read_unlock();
 
-	/* Access the file descriptor table. */
+	task_lock(task);
 	files = task->files;
 	if (!files) {
-		rcu_read_unlock();
+		task_unlock(task);
+		put_task_struct(task);
 		pos = append_str(out, pos, maxlen,
 				 "[kernel thread — no open files]\n", 32);
 		kfree(refs);
@@ -158,7 +174,20 @@ int hackbot_list_fds(int pid, char *out, int maxlen)
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
 
-	for (fd = 0; fd < fdt->max_fds && count < MAX_FD_ENTRIES; fd++) {
+	/*
+	 * R-011: bound the scan. fdt->max_fds can be 1M+ on hosts with a
+	 * raised ulimit -n; walking that many slots under file_lock stalls
+	 * every fd op on the target. MAX_FD_ENTRIES * 16 leaves headroom
+	 * for sparse fdtables while keeping the lock window bounded.
+	 *
+	 * Note: total_fds reflects populated slots within [0, max_scan),
+	 * not the entire fdtable. The truncation message below is therefore
+	 * windowed-scan accurate, not whole-fdtable accurate. Acceptable —
+	 * the agent treats the count as informational.
+	 */
+	max_scan = min(fdt->max_fds, (unsigned int)(MAX_FD_ENTRIES * 16));
+
+	for (fd = 0; fd < max_scan && count < MAX_FD_ENTRIES; fd++) {
 		file = rcu_dereference_check_fdtable(files, fdt->fd[fd]);
 		if (!file)
 			continue;
@@ -171,7 +200,8 @@ int hackbot_list_fds(int pid, char *out, int maxlen)
 	}
 
 	spin_unlock(&files->file_lock);
-	rcu_read_unlock();
+	task_unlock(task);
+	put_task_struct(task);
 
 	/*
 	 * Phase 2: Resolve paths — NO locks held.
