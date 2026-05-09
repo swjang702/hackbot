@@ -26,7 +26,7 @@
 
 struct hackbot_kprobe_slot {
 	bool active;
-	char symbol[MAX_SYMBOL_LEN];
+	char *symbol;
 	atomic64_t count;
 	struct kprobe kp;
 };
@@ -97,10 +97,17 @@ int hackbot_kprobe_attach(const char *symbol, int len)
 		return -ENOSPC;
 	}
 
-	/* Initialize the slot. */
+	/* Initialize the slot.  Symbol is heap-allocated so its lifetime is
+	 * decoupled from the slot storage: the kprobe core retains the
+	 * pointer until unregister_kprobe() returns, and we only kfree()
+	 * after that point.  This makes slot reuse safe against any future
+	 * kprobe-core change that defers symbol-name access. */
 	memset(&slots[free_slot], 0, sizeof(slots[free_slot]));
-	memcpy(slots[free_slot].symbol, symbol, len);
-	slots[free_slot].symbol[len] = '\0';
+	slots[free_slot].symbol = kstrndup(symbol, len, GFP_KERNEL);
+	if (!slots[free_slot].symbol) {
+		mutex_unlock(&kprobe_mutex);
+		return -ENOMEM;
+	}
 	atomic64_set(&slots[free_slot].count, 0);
 
 	slots[free_slot].kp.pre_handler = hackbot_kprobe_pre_handler;
@@ -108,15 +115,36 @@ int hackbot_kprobe_attach(const char *symbol, int len)
 
 	ret = register_kprobe(&slots[free_slot].kp);
 	if (ret < 0) {
+		switch (ret) {
+		case -EINVAL:
+			pr_err("hackbot: kprobe core rejected '%s' (invalid or blacklisted)\n",
+			       slots[free_slot].symbol);
+			break;
+		case -ENOENT:
+			pr_err("hackbot: symbol '%s' not found in kallsyms\n",
+			       slots[free_slot].symbol);
+			break;
+		case -EEXIST:
+			pr_err("hackbot: kprobe already registered for symbol '%s'\n",
+			       slots[free_slot].symbol);
+			break;
+		default:
+			pr_err("hackbot: register_kprobe('%s') failed: %d\n",
+			       slots[free_slot].symbol, ret);
+			break;
+		}
+		kfree(slots[free_slot].symbol);
+		slots[free_slot].symbol = NULL;
+		slots[free_slot].kp.symbol_name = NULL;
 		memset(&slots[free_slot], 0, sizeof(slots[free_slot]));
 		mutex_unlock(&kprobe_mutex);
 		return ret;
 	}
 
 	slots[free_slot].active = true;
+	pr_info_ratelimited("hackbot: kprobe attached to '%s'\n",
+			    slots[free_slot].symbol);
 	mutex_unlock(&kprobe_mutex);
-
-	pr_info_ratelimited("hackbot: kprobe attached to '%s'\n", slots[free_slot].symbol);
 	return 0;
 }
 
@@ -243,9 +271,13 @@ int hackbot_kprobe_detach(const char *symbol, int len)
 		if ((int)strlen(slots[i].symbol) == len &&
 		    memcmp(slots[i].symbol, symbol, len) == 0) {
 			unregister_kprobe(&slots[i].kp);
+			/* kprobe core no longer references symbol_name now. */
 			pr_info_ratelimited("hackbot: kprobe detached from '%s' (hits: %lld)\n",
-				slots[i].symbol,
-				atomic64_read(&slots[i].count));
+					    slots[i].symbol,
+					    atomic64_read(&slots[i].count));
+			kfree(slots[i].symbol);
+			slots[i].symbol = NULL;
+			slots[i].kp.symbol_name = NULL;
 			slots[i].active = false;
 			memset(&slots[i], 0, sizeof(slots[i]));
 			mutex_unlock(&kprobe_mutex);
@@ -271,9 +303,13 @@ void hackbot_kprobe_cleanup(void)
 		if (!slots[i].active)
 			continue;
 		unregister_kprobe(&slots[i].kp);
+		/* kprobe core no longer references symbol_name now. */
 		pr_info_ratelimited("hackbot: cleanup kprobe '%s' (hits: %lld)\n",
-			slots[i].symbol,
-			atomic64_read(&slots[i].count));
+				    slots[i].symbol,
+				    atomic64_read(&slots[i].count));
+		kfree(slots[i].symbol);
+		slots[i].symbol = NULL;
+		slots[i].kp.symbol_name = NULL;
 		slots[i].active = false;
 		memset(&slots[i], 0, sizeof(slots[i]));
 	}
