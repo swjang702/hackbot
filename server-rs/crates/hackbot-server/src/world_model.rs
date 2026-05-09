@@ -16,7 +16,7 @@ pub struct WorldModel {
 
 #[derive(Debug, Clone)]
 struct FdEntry {
-    fd_type: String,
+    _fd_type: String,
     _path: Option<String>,
 }
 
@@ -112,7 +112,7 @@ impl WorldModel {
             self.fd_table.insert(
                 (event.pid, ret),
                 FdEntry {
-                    fd_type: "file".to_string(),
+                    _fd_type: "file".to_string(),
                     _path: None,
                 },
             );

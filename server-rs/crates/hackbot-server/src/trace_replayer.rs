@@ -119,11 +119,6 @@ impl TraceReplayer {
         self.filter_types = types.map(|t| t.into_iter().collect());
     }
 
-    pub fn reset(&mut self) {
-        self.position = 0;
-        self.playing = false;
-    }
-
     fn passes_filter(&self, event: &TraceEvent) -> bool {
         if let Some(ref pids) = self.filter_pids {
             if !pids.contains(&event.pid) {
