@@ -387,39 +387,9 @@ pub(crate) fn generate_from_tokens(
 
     reset_kv_cache(slot);
 
-    let debug_n = if n_prompt < 10 { n_prompt } else { 10 };
-    for i in 0..debug_n {
-        pr_info!("hackbot: prompt[{}] = {}\n", i, prompt_tokens[i]);
-    }
-    if n_prompt > 10 {
-        pr_info!("hackbot: ... ({} more prompt tokens)\n", n_prompt - 10);
-    }
-
     // Prefill
     for i in 0..n_prompt {
         forward_token(slot, prompt_tokens[i] as usize, i);
-    }
-
-    // Debug: print logits after prefill (v1 only)
-    if slot.format_version != MODEL_FORMAT_V2 && slot.inf_buf_addr != 0 {
-        let logits_ptr = (slot.inf_buf_addr as *const i32).wrapping_add(slot.inf_logits);
-        let vs = slot.config.vocab_size as usize;
-        let mut best = [0usize; 3];
-        for i in 0..vs {
-            let v = unsafe { *logits_ptr.add(i) };
-            for b in 0..3 {
-                if v > unsafe { *logits_ptr.add(best[b]) } {
-                    let mut j = 2;
-                    while j > b { best[j] = best[j-1]; j -= 1; }
-                    best[b] = i;
-                    break;
-                }
-            }
-        }
-        for b in 0..3 {
-            let v = unsafe { *logits_ptr.add(best[b]) };
-            pr_info!("hackbot: prefill logit top-{}: token {} logit {}\n", b+1, best[b], v);
-        }
     }
 
     // Autoregressive generation
@@ -432,7 +402,6 @@ pub(crate) fn generate_from_tokens(
              next_token, gen_limit, pos);
 
     let mut decode_buf = [0u8; 64];
-    let mut gen_count = 0usize;
 
     for _ in 0..gen_limit {
         let tok = next_token as u32;
@@ -444,11 +413,6 @@ pub(crate) fn generate_from_tokens(
             pr_info!("hackbot: gen stop: max seq at pos {}\n", pos);
             break;
         }
-
-        if gen_count < 20 {
-            pr_info!("hackbot: gen[{}]: token {} at pos {}\n", gen_count, next_token, pos);
-        }
-        gen_count += 1;
 
         let tok_bytes = decode_token_bytes(data, tok_offsets, next_token);
         let raw_len = gpt2_decode_token(tok_bytes, &mut decode_buf);

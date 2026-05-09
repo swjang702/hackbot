@@ -5,9 +5,8 @@
 use kernel::prelude::*;
 
 use crate::config::*;
-use crate::forward::{forward_token, reset_kv_cache};
 use crate::state::MODEL;
-use crate::tokenizer::{encode_bpe, generate_from_tokens, get_next_token};
+use crate::tokenizer::{encode_bpe, generate_from_tokens};
 use crate::tools::{execute_tool, parse_tool_call, ToolCallResult};
 
 /// Append a ChatML message to the token array.
@@ -77,22 +76,6 @@ pub(crate) fn agent_loop_local(prompt: &[u8]) -> Result<KVVec<u8>> {
         core::slice::from_raw_parts(slot.data_addr as *const u8, slot.data_len)
     };
     let _tok_offsets = slot.tok_offsets_addr as *const u32;
-
-    // DEBUG: Quick single-token sanity test
-    {
-        reset_kv_cache(&slot);
-        forward_token(&slot, 1, 0);
-        let top1 = get_next_token(&slot);
-        pr_info!("hackbot: DEBUG single-token test: after token 1, top1 = {}\n", top1);
-        if slot.format_version != MODEL_FORMAT_V2 && slot.inf_buf_addr != 0 {
-            let logits_ptr = (slot.inf_buf_addr as *const i32).wrapping_add(slot.inf_logits);
-            let top1_logit = unsafe { *logits_ptr.add(top1) };
-            pr_info!("hackbot: DEBUG top1 logit = {}\n", top1_logit);
-            let logit_28 = unsafe { *logits_ptr.add(28) };
-            let logit_198 = unsafe { *logits_ptr.add(198) };
-            pr_info!("hackbot: DEBUG logits: token28={}, token198={}\n", logit_28, logit_198);
-        }
-    }
 
     let mut tokens = [0u32; INFERENCE_MAX_SEQ];
     let mut n_tokens = 0usize;
