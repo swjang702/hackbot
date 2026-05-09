@@ -262,7 +262,17 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
             e
         })?;
 
-    let mut layers = [LayerRef::ZERO; MODEL_MAX_LAYERS];
+    // Heap-allocate the layer scratch array. `[LayerRef; MODEL_MAX_LAYERS]`
+    // is ~8.7 KiB and would otherwise live on the kernel stack alongside
+    // parse_and_store_model's other locals while MODEL.lock() is held,
+    // pushing close to the 16 KiB stack limit. See R-029 in
+    // docs/REVIEW_v0.1.md.
+    let mut layers: KBox<[LayerRef; MODEL_MAX_LAYERS]> =
+        KBox::new([LayerRef::ZERO; MODEL_MAX_LAYERS], GFP_KERNEL).map_err(|e| {
+            unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
+            pr_err!("hackbot: failed to allocate layer scratch array\n");
+            e
+        })?;
     for l in 0..n_layers {
         let rms_att_off = norm_ref_advance(&mut cursor, dim, data.len())
             .map_err(|e| {
@@ -325,7 +335,7 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
     slot.tok_section_off = tok_section_off;
     slot.tok_offsets_addr = tok_ptr as usize;
     slot.embed = embed;
-    slot.layers = layers;
+    slot.layers = *layers;
     slot.rms_final_off = rms_final_off;
     slot.format_version = MODEL_FORMAT_V1;
     slot.weights_off = weights_start;
