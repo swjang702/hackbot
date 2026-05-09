@@ -947,21 +947,25 @@ int hackbot_trace_init(void)
 		/* Non-fatal: tracing works without n-gram learning */
 	}
 
-	/* Discover tracepoints by name */
+	/* Discover tracepoints by name. A tracepoint that isn't present in
+	 * this kernel's build (NULL pointer here) is non-fatal — we just
+	 * register what's available. A tracepoint that IS present but whose
+	 * registration call fails is fatal: we roll back so the contract
+	 * is "all probes we asked for are on, or none". */
 	s->tp_sched_switch = find_tracepoint("sched_switch");
 	s->tp_sys_enter = find_tracepoint("sys_enter");
 	s->tp_block_rq_complete = find_tracepoint("block_rq_complete");
 
-	/* Register callbacks */
+	/* Register callbacks. R-020: failure of any registration unwinds
+	 * the previously-registered probes. */
 	if (s->tp_sched_switch) {
 		ret = tracepoint_probe_register(s->tp_sched_switch,
 			hackbot_probe_sched_switch, s);
 		if (ret) {
 			pr_warn("hackbot: trace: sched_switch register failed (%d)\n", ret);
-			s->tp_sched_switch = NULL;
-		} else {
-			pr_info("hackbot: trace: sched_switch registered\n");
+			goto err_sched;
 		}
+		pr_info("hackbot: trace: sched_switch registered\n");
 	} else {
 		pr_warn("hackbot: trace: sched_switch tracepoint not found\n");
 	}
@@ -971,10 +975,9 @@ int hackbot_trace_init(void)
 			hackbot_probe_sys_enter, s);
 		if (ret) {
 			pr_warn("hackbot: trace: sys_enter register failed (%d)\n", ret);
-			s->tp_sys_enter = NULL;
-		} else {
-			pr_info("hackbot: trace: sys_enter registered\n");
+			goto err_syscall;
 		}
+		pr_info("hackbot: trace: sys_enter registered\n");
 	} else {
 		pr_warn("hackbot: trace: sys_enter tracepoint not found\n");
 	}
@@ -984,10 +987,9 @@ int hackbot_trace_init(void)
 			hackbot_probe_block_rq_complete, s);
 		if (ret) {
 			pr_warn("hackbot: trace: block_rq_complete register failed (%d)\n", ret);
-			s->tp_block_rq_complete = NULL;
-		} else {
-			pr_info("hackbot: trace: block_rq_complete registered\n");
+			goto err_io;
 		}
+		pr_info("hackbot: trace: block_rq_complete registered\n");
 	} else {
 		pr_info("hackbot: trace: block_rq_complete tracepoint not found (no block devices?)\n");
 	}
@@ -1001,6 +1003,23 @@ int hackbot_trace_init(void)
 		s->tp_block_rq_complete ? "io " : "");
 
 	return 0;
+
+	/* R-020 rollback chain: unregister whatever we registered, drain
+	 * in-flight callbacks via tracepoint_synchronize_unregister(),
+	 * tear down the tokenizer/ngram subsystems we already brought up
+	 * above, then fall through to fail: for buffer cleanup. */
+err_io:
+	if (s->tp_sys_enter)
+		tracepoint_probe_unregister(s->tp_sys_enter,
+			hackbot_probe_sys_enter, s);
+err_syscall:
+	if (s->tp_sched_switch)
+		tracepoint_probe_unregister(s->tp_sched_switch,
+			hackbot_probe_sched_switch, s);
+err_sched:
+	tracepoint_synchronize_unregister();
+	hackbot_ngram_exit();
+	hackbot_tokenizer_exit();
 
 fail:
 	if (s->sched_ring)   kvfree(s->sched_ring);
