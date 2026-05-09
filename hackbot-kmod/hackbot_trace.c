@@ -352,17 +352,32 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 	u64 now = ktime_get_ns();  /* Must match block layer's clock (not raw) */
 	unsigned int idx;
 	unsigned long flags;
-	u32 latency_us;
+	u32 latency_us = 0;
+	bool latency_valid;
 	int bucket;
 	struct io_features *p;
 
-	/* Compute I/O latency from request start time.
-	 * rq->start_time_ns uses ktime_get_ns() (adjusted monotonic),
-	 * so we must use the same clock here — NOT ktime_get_raw_fast_ns(). */
-	if (now > rq->start_time_ns)
+	/*
+	 * Compute I/O latency from request start time.
+	 * rq->start_time_ns uses ktime_get_ns() (adjusted monotonic), so we
+	 * must use the same clock here — NOT ktime_get_raw_fast_ns().
+	 *
+	 * R-019: rq->start_time_ns is only populated for accounted requests
+	 * (RQF_IO_STAT|RQF_STATS|RQF_USE_SCHED). For un-accounted requests
+	 * the field can be 0 or stale-from-recycled-struct. The previous
+	 * `now > rq->start_time_ns` test was true for start=0 and yielded
+	 * latency_us = now/1000 ≈ billions of µs, poisoning the histogram,
+	 * the per-CPU latency window, and the tokenizer's duration_class.
+	 * Gate latency-derived stats on a known-good start_time_ns.
+	 * Aggregate I/O counters still increment — we observed an I/O
+	 * completion, just don't have a reliable latency for it.
+	 */
+	if (rq->start_time_ns && now > rq->start_time_ns) {
 		latency_us = (u32)((now - rq->start_time_ns) / 1000);
-	else
-		latency_us = 0;  /* clock skew guard */
+		latency_valid = true;
+	} else {
+		latency_valid = false;
+	}
 
 	/* Tier 1: Raw ring */
 	idx = (unsigned int)atomic_inc_return(&s->io_ring_head)
@@ -381,7 +396,8 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 	local_irq_save(flags);
 	p = this_cpu_ptr(&io_pcpu);
 	write_seqcount_begin(&p->seq);
-	shift_u32_window(p->last_latencies_us, FEATURE_WINDOW, latency_us);
+	if (latency_valid)
+		shift_u32_window(p->last_latencies_us, FEATURE_WINDOW, latency_us);
 	p->ios_in_window++;
 	if (now - p->window_start_ns > 1000000000ULL) {
 		p->ios_in_window = 1;
@@ -393,18 +409,20 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 	/* Tier 3: Aggregates */
 	atomic64_inc(&s->io_agg.total);
 	atomic64_inc(&s->io_agg.total_since_reset);
-	atomic64_add(latency_us, &s->io_agg.total_latency_us);
+	if (latency_valid) {
+		atomic64_add(latency_us, &s->io_agg.total_latency_us);
 
-	/* Latency histogram */
-	if (latency_us < 100)        bucket = 0;
-	else if (latency_us < 500)   bucket = 1;
-	else if (latency_us < 1000)  bucket = 2;
-	else if (latency_us < 5000)  bucket = 3;
-	else if (latency_us < 10000) bucket = 4;
-	else if (latency_us < 50000) bucket = 5;
-	else if (latency_us < 100000) bucket = 6;
-	else                          bucket = 7;
-	atomic64_inc(&s->io_agg.lat_buckets[bucket]);
+		/* Latency histogram */
+		if (latency_us < 100)        bucket = 0;
+		else if (latency_us < 500)   bucket = 1;
+		else if (latency_us < 1000)  bucket = 2;
+		else if (latency_us < 5000)  bucket = 3;
+		else if (latency_us < 10000) bucket = 4;
+		else if (latency_us < 50000) bucket = 5;
+		else if (latency_us < 100000) bucket = 6;
+		else                          bucket = 7;
+		atomic64_inc(&s->io_agg.lat_buckets[bucket]);
+	}
 
 	/* Tier 4: Semantic tokenization */
 	hackbot_tokenize_io(rq, blk_status_to_errno(error), nr_bytes,
