@@ -110,34 +110,37 @@ pub(crate) fn execute_tool(raw: &[u8]) -> KVVec<u8> {
     output
 }
 
-/// Format a single task_struct into the ps output line.
+/// Snapshot of one task_struct's fields, taken under RCU and formatted later.
 ///
-/// # Safety
-/// `task` must be a valid pointer to a task_struct under RCU protection.
-unsafe fn format_task(output: &mut KVVec<u8>, task: *const bindings::task_struct) {
-    let pid = unsafe { (*task).pid };
-    let ppid = unsafe {
-        let parent = (*task).real_parent;
-        if parent.is_null() { 0 } else { (*parent).pid }
-    };
-    let state = unsafe { (*task).__state };
-    let comm = unsafe { &(*task).comm };
+/// Holding only POD copies means formatting (which sleeps in kvmalloc) can run
+/// after the RCU read-side lock is released.  See R-013 in docs/REVIEW_v0.1.md.
+struct TaskSnapshot {
+    pid: i32,
+    ppid: i32,
+    state: u32,
+    comm: [u8; 16],
+    is_kthread: bool,
+}
 
+/// Format a single snapshot into the ps output line.  Allocations here are
+/// fine — the RCU read-side has already been released.
+fn format_snapshot(output: &mut KVVec<u8>, s: &TaskSnapshot) {
     let mut num = [0u8; 20];
 
-    let s = format_usize(pid as usize, &mut num);
-    let _ = output.extend_from_slice(s, GFP_KERNEL);
-    for _ in 0..(8usize.saturating_sub(s.len())) {
+    let pid_s = format_usize(s.pid as usize, &mut num);
+    let _ = output.extend_from_slice(pid_s, GFP_KERNEL);
+    for _ in 0..(8usize.saturating_sub(pid_s.len())) {
         let _ = output.push(b' ', GFP_KERNEL);
     }
 
-    let s = format_usize(ppid as usize, &mut num);
-    let _ = output.extend_from_slice(s, GFP_KERNEL);
-    for _ in 0..(8usize.saturating_sub(s.len())) {
+    let mut num2 = [0u8; 20];
+    let ppid_s = format_usize(s.ppid as usize, &mut num2);
+    let _ = output.extend_from_slice(ppid_s, GFP_KERNEL);
+    for _ in 0..(8usize.saturating_sub(ppid_s.len())) {
         let _ = output.push(b' ', GFP_KERNEL);
     }
 
-    let state_ch = match state {
+    let state_ch = match s.state {
         0 => b'R',
         1 => b'S',
         2 => b'D',
@@ -151,65 +154,128 @@ unsafe fn format_task(output: &mut KVVec<u8>, task: *const bindings::task_struct
     let _ = output.push(state_ch, GFP_KERNEL);
     let _ = output.extend_from_slice(b"      ", GFP_KERNEL);
 
-    for &c in comm.iter() {
+    for &c in s.comm.iter() {
         if c == 0 {
             break;
         }
-        let _ = output.push(c as u8, GFP_KERNEL);
+        let _ = output.push(c, GFP_KERNEL);
     }
     let _ = output.push(b'\n', GFP_KERNEL);
 }
 
 /// Tool: `ps` — list running processes by walking the kernel task list.
+///
+/// Takes a snapshot of every reachable task under RCU (no allocation, no
+/// sleeping) and emits the formatted output afterwards.  See R-013 in
+/// docs/REVIEW_v0.1.md: the previous version called `KVVec::push(GFP_KERNEL)`
+/// inside `rcu::read_lock()`, which can sleep on `kvmalloc` and is a hard
+/// kernel rule violation.
 fn tool_ps(output: &mut KVVec<u8>) {
     let tasks_offset = mem::offset_of!(bindings::task_struct, tasks);
 
-    let _rcu = rcu::read_lock();
+    // Pre-allocate the snapshot buffer outside the RCU section.
+    // 512 × ~28 B ≈ 14 KiB — too large for the kernel stack, must be heap.
+    let mut snapshots: KVVec<TaskSnapshot> = match KVVec::with_capacity(MAX_PS_TASKS, GFP_KERNEL) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = output.extend_from_slice(
+                b"[Error: failed to allocate ps snapshot buffer]\n",
+                GFP_KERNEL,
+            );
+            return;
+        }
+    };
 
-    let init = ptr::addr_of!(bindings::init_task);
-    let list_head = unsafe { ptr::addr_of!((*init).tasks) };
+    // ---- RCU read-side: snapshot only.  No allocation, no sleeping. ----
+    {
+        let _rcu = rcu::read_lock();
 
-    let mut count = 0usize;
+        // SAFETY: `init_task` is a kernel-exported global with static
+        // lifetime; taking its address is always valid.
+        let init = ptr::addr_of!(bindings::init_task);
+        // SAFETY: `init` points to a valid `task_struct`, so the address of
+        // its `tasks` field is well-formed.
+        let list_head = unsafe { ptr::addr_of!((*init).tasks) };
 
-    // Pass 1: User-space processes (mm != NULL).
+        // SAFETY: `(*list_head).next` is read under the RCU read-side lock,
+        // so the pointee remains live for the duration of this section.
+        let mut current = unsafe { (*list_head).next };
+
+        while current != list_head as *mut bindings::list_head
+            && snapshots.len() < MAX_PS_TASKS
+        {
+            // SAFETY: `current` points into a `task_struct`'s `tasks` list_head
+            // member; subtracting `tasks_offset` recovers the containing
+            // task_struct (kernel `container_of` idiom).  The task is alive
+            // because the RCU read-side is held.
+            let task = unsafe {
+                (current as *const u8).sub(tasks_offset) as *const bindings::task_struct
+            };
+
+            // SAFETY: `task` is a live `task_struct` under RCU.  All field
+            // reads here return POD values copied into the snapshot — no
+            // pointers escape the RCU section.
+            let pid = unsafe { (*task).pid };
+            let ppid = unsafe {
+                let parent = (*task).real_parent;
+                if parent.is_null() { 0 } else { (*parent).pid }
+            };
+            let state = unsafe { (*task).__state };
+            let is_kthread = unsafe { (*task).mm.is_null() };
+
+            // `comm` is racy against `set_task_comm()`; torn names are
+            // accepted as cosmetic.  See R-028 for the systematic fix class.
+            let mut comm = [0u8; 16];
+            // SAFETY: `(*task).comm` is a `char[TASK_COMM_LEN]` (16 bytes)
+            // owned by the live task_struct; the byte-by-byte copy stays
+            // within bounds.
+            unsafe {
+                let src = &(*task).comm;
+                for i in 0..16 {
+                    comm[i] = src[i] as u8;
+                }
+            }
+
+            // `push_within_capacity` does not allocate (we reserved
+            // `MAX_PS_TASKS` upfront); the loop bound also guarantees it
+            // never returns Err.  Either way, we cannot allocate here.
+            let _ = snapshots.push_within_capacity(TaskSnapshot {
+                pid,
+                ppid,
+                state,
+                comm,
+                is_kthread,
+            });
+
+            // SAFETY: `current` is still live under RCU; `next` is a valid
+            // forward pointer in the task list.
+            current = unsafe { (*current).next };
+        }
+        // _rcu drops here — RCU read-side released before we touch GFP_KERNEL.
+    }
+
+    // ---- Outside RCU: format.  Sleeping allocations are now fine. ----
     let _ = output.extend_from_slice(
         b"=== User-Space Processes ===\nPID      PPID     STATE  COMM\n",
         GFP_KERNEL,
     );
-    let mut current = unsafe { (*list_head).next };
-    while current != list_head as *mut bindings::list_head && count < MAX_PS_TASKS {
-        let task = unsafe {
-            (current as *const u8).sub(tasks_offset) as *const bindings::task_struct
-        };
-        let mm = unsafe { (*task).mm };
-        if !mm.is_null() {
-            unsafe { format_task(output, task) };
-            count += 1;
-        }
-        current = unsafe { (*current).next };
-    }
-
-    // Pass 2: Kernel threads (mm == NULL).
-    if count < MAX_PS_TASKS {
-        let _ = output.extend_from_slice(
-            b"\n=== Kernel Threads ===\nPID      PPID     STATE  COMM\n",
-            GFP_KERNEL,
-        );
-        current = unsafe { (*list_head).next };
-        while current != list_head as *mut bindings::list_head && count < MAX_PS_TASKS {
-            let task = unsafe {
-                (current as *const u8).sub(tasks_offset) as *const bindings::task_struct
-            };
-            let mm = unsafe { (*task).mm };
-            if mm.is_null() {
-                unsafe { format_task(output, task) };
-                count += 1;
-            }
-            current = unsafe { (*current).next };
+    for s in snapshots.iter() {
+        if !s.is_kthread {
+            format_snapshot(output, s);
         }
     }
 
-    if count >= MAX_PS_TASKS {
+    let _ = output.extend_from_slice(
+        b"\n=== Kernel Threads ===\nPID      PPID     STATE  COMM\n",
+        GFP_KERNEL,
+    );
+    for s in snapshots.iter() {
+        if s.is_kthread {
+            format_snapshot(output, s);
+        }
+    }
+
+    if snapshots.len() >= MAX_PS_TASKS {
         let _ = output.extend_from_slice(b"[... truncated]\n", GFP_KERNEL);
     }
 }
