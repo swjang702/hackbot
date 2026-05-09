@@ -28,6 +28,7 @@
 #include <linux/atomic.h>
 #include <linux/timekeeping.h>
 #include <linux/slab.h>
+#include <linux/log2.h>
 #include "hackbot_trace.h"
 #include "hackbot_tokenizer.h"
 #include "hackbot_ngram.h"
@@ -188,12 +189,13 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 {
 	struct hackbot_trace_state *s = data;
 	u64 now = ktime_get_raw_fast_ns();
-	int idx;
+	unsigned int idx;
 	unsigned long flags;
 	u32 interval_us;
 
 	/* Tier 1: Raw ring buffer */
-	idx = atomic_inc_return(&s->sched_ring_head) % RAW_RING_SIZE;
+	idx = (unsigned int)atomic_inc_return(&s->sched_ring_head)
+	      & (RAW_RING_SIZE - 1);
 	s->sched_ring[idx].timestamp_ns = now;
 	s->sched_ring[idx].cpu = raw_smp_processor_id();
 	s->sched_ring[idx].prev_pid = prev->pid;
@@ -268,12 +270,13 @@ static void hackbot_probe_sys_enter(void *data, struct pt_regs *regs, long id)
 {
 	struct hackbot_trace_state *s = data;
 	u64 now = ktime_get_raw_fast_ns();
-	int idx;
+	unsigned int idx;
 	unsigned long flags;
 	u32 interval_us;
 
 	/* Tier 1: Raw ring */
-	idx = atomic_inc_return(&s->syscall_ring_head) % RAW_RING_SIZE;
+	idx = (unsigned int)atomic_inc_return(&s->syscall_ring_head)
+	      & (RAW_RING_SIZE - 1);
 	s->syscall_ring[idx].timestamp_ns = now;
 	s->syscall_ring[idx].cpu = raw_smp_processor_id();
 	s->syscall_ring[idx].pid = current->pid;
@@ -314,7 +317,7 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 {
 	struct hackbot_trace_state *s = data;
 	u64 now = ktime_get_ns();  /* Must match block layer's clock (not raw) */
-	int idx;
+	unsigned int idx;
 	unsigned long flags;
 	u32 latency_us;
 	int bucket;
@@ -328,7 +331,8 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 		latency_us = 0;  /* clock skew guard */
 
 	/* Tier 1: Raw ring */
-	idx = atomic_inc_return(&s->io_ring_head) % RAW_RING_SIZE;
+	idx = (unsigned int)atomic_inc_return(&s->io_ring_head)
+	      & (RAW_RING_SIZE - 1);
 	s->io_ring[idx].timestamp_ns = now;
 	s->io_ring[idx].cpu = raw_smp_processor_id();
 	s->io_ring[idx].sector = blk_rq_pos(rq);
@@ -490,20 +494,20 @@ int hackbot_trace_read_sched_raw(char *out, int maxlen, int count)
 {
 	struct hackbot_trace_state *s = trace_state;
 	int pos = 0, i;
-	int head, start;
+	unsigned int head, start;
 
 	if (!s || !s->active) return 0;
 	if (count <= 0 || count > RAW_RING_SIZE) count = 20;
 
-	head = atomic_read(&s->sched_ring_head);
-	start = (head - count + RAW_RING_SIZE) % RAW_RING_SIZE;
+	head = (unsigned int)atomic_read(&s->sched_ring_head);
+	start = (head - (unsigned int)count) & (RAW_RING_SIZE - 1);
 
 	pos = append_str(out, pos, maxlen, "=== Raw: sched_switch (last ");
 	pos = append_num(out, pos, maxlen, count);
 	pos = append_str(out, pos, maxlen, ") ===\n");
 
 	for (i = 0; i < count && pos > 0 && pos < maxlen - 128; i++) {
-		int idx = (start + i) % RAW_RING_SIZE;
+		unsigned int idx = (start + (unsigned int)i) & (RAW_RING_SIZE - 1);
 		struct raw_sched_event *ev = &s->sched_ring[idx];
 		u64 rel_s, rel_ms;
 
@@ -591,20 +595,21 @@ int hackbot_trace_read_syscall(char *out, int maxlen)
 int hackbot_trace_read_syscall_raw(char *out, int maxlen, int count)
 {
 	struct hackbot_trace_state *s = trace_state;
-	int pos = 0, i, head, start;
+	int pos = 0, i;
+	unsigned int head, start;
 
 	if (!s || !s->active) return 0;
 	if (count <= 0 || count > RAW_RING_SIZE) count = 20;
 
-	head = atomic_read(&s->syscall_ring_head);
-	start = (head - count + RAW_RING_SIZE) % RAW_RING_SIZE;
+	head = (unsigned int)atomic_read(&s->syscall_ring_head);
+	start = (head - (unsigned int)count) & (RAW_RING_SIZE - 1);
 
 	pos = append_str(out, pos, maxlen, "=== Raw: sys_enter (last ");
 	pos = append_num(out, pos, maxlen, count);
 	pos = append_str(out, pos, maxlen, ") ===\n");
 
 	for (i = 0; i < count && pos > 0 && pos < maxlen - 100; i++) {
-		int idx = (start + i) % RAW_RING_SIZE;
+		unsigned int idx = (start + (unsigned int)i) & (RAW_RING_SIZE - 1);
 		struct raw_syscall_event *ev = &s->syscall_ring[idx];
 		if (ev->timestamp_ns == 0) continue;
 
@@ -682,20 +687,21 @@ int hackbot_trace_read_io(char *out, int maxlen)
 int hackbot_trace_read_io_raw(char *out, int maxlen, int count)
 {
 	struct hackbot_trace_state *s = trace_state;
-	int pos = 0, i, head, start;
+	int pos = 0, i;
+	unsigned int head, start;
 
 	if (!s || !s->active) return 0;
 	if (count <= 0 || count > RAW_RING_SIZE) count = 20;
 
-	head = atomic_read(&s->io_ring_head);
-	start = (head - count + RAW_RING_SIZE) % RAW_RING_SIZE;
+	head = (unsigned int)atomic_read(&s->io_ring_head);
+	start = (head - (unsigned int)count) & (RAW_RING_SIZE - 1);
 
 	pos = append_str(out, pos, maxlen, "=== Raw: block_rq_complete (last ");
 	pos = append_num(out, pos, maxlen, count);
 	pos = append_str(out, pos, maxlen, ") ===\n");
 
 	for (i = 0; i < count && pos > 0 && pos < maxlen - 100; i++) {
-		int idx = (start + i) % RAW_RING_SIZE;
+		unsigned int idx = (start + (unsigned int)i) & (RAW_RING_SIZE - 1);
 		struct raw_io_event *ev = &s->io_ring[idx];
 		if (ev->timestamp_ns == 0) continue;
 
@@ -758,6 +764,9 @@ int hackbot_trace_init(void)
 {
 	struct hackbot_trace_state *s;
 	int ret;
+
+	/* Ring index masking below assumes RAW_RING_SIZE is a power of two. */
+	BUILD_BUG_ON(!is_power_of_2(RAW_RING_SIZE));
 
 	s = kzalloc(sizeof(*s), GFP_KERNEL);
 	if (!s)
