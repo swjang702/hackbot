@@ -19,6 +19,7 @@
 #include <linux/string.h>
 #include <linux/math64.h>
 #include <linux/random.h>
+#include <linux/sched.h>
 #include <asm/fpu/api.h>
 
 #include "hackbot_fpu.h"
@@ -50,6 +51,21 @@
  */
 #define HACKBOT_TEMPERATURE   70    /* 0.70 — good balance for small models */
 #define HACKBOT_TOP_K         40    /* consider top 40 tokens */
+
+/*
+ * FPU tile budget for the final logits matmul.
+ *
+ * The whole forward pass is decomposed into tiles, each bracketed by
+ * kernel_fpu_begin()/kernel_fpu_end(). The largest single op in the
+ * pass is the vocab×dim logits projection (e.g. 49152×576 ≈ 28 M MAC),
+ * which would blow the per-tile latency budget if executed in one
+ * window. We slice it into chunks of LOGITS_ROWS_PER_TILE output rows.
+ *
+ * 1024 rows × 576 cols ≈ 0.6 M MAC ≈ ~0.6 ms per tile on x86_64
+ * software fp — safely under the ~1 ms target that keeps softirq
+ * latency bounded.
+ */
+#define LOGITS_ROWS_PER_TILE  1024
 
 /* ===================================================================
  * FP16 → float32 conversion (software, no SSE/AVX needed)
@@ -348,6 +364,28 @@ static inline float silu_f32(float x)
  * Forward pass
  * =================================================================== */
 
+/*
+ * Run one transformer forward pass for `token_id` at sequence position
+ * `pos`, decomposed into bounded FPU windows.
+ *
+ * Each `kernel_fpu_begin()/kernel_fpu_end()` pair brackets a "tile" of
+ * float work whose runtime is empirically under ~1 ms on x86_64. The
+ * outer caller (`hackbot_fpu_forward`) does NOT wrap this function in
+ * an FPU window — every float access in the body lives inside one of
+ * the per-tile windows opened here.
+ *
+ * Discipline (must hold for correctness):
+ *   1. Between kernel_fpu_end() and the next kernel_fpu_begin(), this
+ *      function performs only integer/pointer work. No float loads,
+ *      stores, or arithmetic. Activations live in heap-backed buffers
+ *      (st->x, st->xb, ...) and are reloaded by the next tile's
+ *      helpers from memory.
+ *   2. None of the math helpers (matmul_fp16, rmsnorm_f32, rope_f32,
+ *      softmax_f32, silu_f32, fp16_to_f32) call kernel_fpu_begin/end
+ *      themselves — they just assume the caller has opened a window.
+ *   3. cond_resched() is invoked only OUTSIDE FPU windows, since it
+ *      can sleep and kernel_fpu_end() has already re-enabled BH.
+ */
 static void forward_token_impl(struct hackbot_fpu_state *st,
 				const u8 *weights, int token_id, int pos)
 {
@@ -359,7 +397,9 @@ static void forward_token_impl(struct hackbot_fpu_state *st,
 	int head_dim = c->head_dim;
 	int kv_dim = n_kv_heads * head_dim;
 	int hpg = c->heads_per_group;
+	int vocab_size = c->vocab_size;
 	int l, h, p, d;
+	int row_off, chunk;
 
 	float *x = st->x;
 	float *xb = st->xb;
@@ -378,40 +418,43 @@ static void forward_token_impl(struct hackbot_fpu_state *st,
 	size_t kv_layer_stride = 2 * kv_type_stride;
 	float *kv = st->kv_cache;
 
-	/* === Step 1: Embedding lookup === */
+	/* === Tile T0: Embedding lookup === */
+	kernel_fpu_begin();
 	{
 		const u16 *embed = (const u16 *)(weights + st->embed_off);
 		const u16 *row = embed + (size_t)token_id * dim;
 		for (d = 0; d < dim; d++)
 			x[d] = fp16_to_f32(row[d]);
-
-		if (pos == 0) {
-			pr_info("hackbot_fpu: embed[%d]: x[0..4] = [%d, %d, %d, %d] (x1000)\n",
-				token_id,
-				(int)(x[0] * 1000), (int)(x[1] * 1000),
-				(int)(x[2] * 1000), (int)(x[3] * 1000));
-		}
 	}
+	kernel_fpu_end();
 
-	/* === Step 2: Transformer layers === */
+	/* === Transformer layers === */
 	for (l = 0; l < c->n_layers; l++) {
 		struct hackbot_layer_offsets *lo = &st->layers[l];
 
-		/* 2a: Pre-attention RMSNorm */
+		/* --- Tile T1: pre-attn RMSNorm + QKV projections --- */
+		kernel_fpu_begin();
 		rmsnorm_f32(xb, x, weights + lo->rms_att, dim);
-
-		/* 2b: QKV projections */
 		matmul_fp16(q_buf, xb, weights + lo->wq, dim, dim);
 		matmul_fp16(k_buf, xb, weights + lo->wk, kv_dim, dim);
 		matmul_fp16(v_buf, xb, weights + lo->wv, kv_dim, dim);
+		kernel_fpu_end();
 
-		/* 2c: RoPE */
+		/*
+		 * --- Tile T2: RoPE + KV-cache store + attention + wo +
+		 *               residual ---
+		 *
+		 * KV-store walks float values through pointer dereferences
+		 * (kv[k_off + d] = k_buf[...]) — those are float loads/stores
+		 * and therefore must remain inside the FPU window, even
+		 * though the operation is conceptually a memcpy. Keep it
+		 * grouped with the attention math.
+		 */
+		kernel_fpu_begin();
 		for (h = 0; h < n_heads; h++)
 			rope_f32(q_buf + h * head_dim, pos, head_dim);
 		for (h = 0; h < n_kv_heads; h++)
 			rope_f32(k_buf + h * head_dim, pos, head_dim);
-
-		/* 2d: Store K, V in cache */
 		{
 			size_t base = (size_t)l * kv_layer_stride;
 			for (h = 0; h < n_kv_heads; h++) {
@@ -426,8 +469,6 @@ static void forward_token_impl(struct hackbot_fpu_state *st,
 				}
 			}
 		}
-
-		/* 2e: Multi-head attention with GQA */
 		{
 			float inv_sqrt_hd = 1.0f / sqrtf_approx((float)head_dim);
 			size_t base = (size_t)l * kv_layer_stride;
@@ -451,65 +492,72 @@ static void forward_token_impl(struct hackbot_fpu_state *st,
 				softmax_f32(att_buf, pos + 1);
 
 				/* Weighted V sum */
-				size_t v_base = base + kv_type_stride
-					+ (size_t)kv_group * kv_head_stride;
-				for (d = 0; d < head_dim; d++) {
-					float acc = 0.0f;
-					for (p = 0; p <= pos; p++)
-						acc += att_buf[p]
-						     * kv[v_base + (size_t)p * head_dim + d];
-					xb[h * head_dim + d] = acc;
+				{
+					size_t v_base = base + kv_type_stride
+						+ (size_t)kv_group * kv_head_stride;
+					for (d = 0; d < head_dim; d++) {
+						float acc = 0.0f;
+						for (p = 0; p <= pos; p++)
+							acc += att_buf[p]
+							     * kv[v_base + (size_t)p * head_dim + d];
+						xb[h * head_dim + d] = acc;
+					}
 				}
 			}
 		}
-
-		/* 2f: Output projection */
 		matmul_fp16(xb2, xb, weights + lo->wo, dim, dim);
-
-		/* 2g: Residual */
 		for (d = 0; d < dim; d++)
 			x[d] += xb2[d];
+		kernel_fpu_end();
 
-		/* 2h: Pre-FFN RMSNorm */
+		/* --- Tile T3: pre-FFN RMSNorm + FFN gate matmul --- */
+		kernel_fpu_begin();
 		rmsnorm_f32(xb, x, weights + lo->rms_ffn, dim);
-
-		/* 2i: SwiGLU FFN */
 		matmul_fp16(hb, xb, weights + lo->gate, hidden_dim, dim);
+		kernel_fpu_end();
+
+		/* --- Tile T4: FFN up + SwiGLU fusion --- */
+		kernel_fpu_begin();
 		matmul_fp16(hb2, xb, weights + lo->up, hidden_dim, dim);
 		for (d = 0; d < hidden_dim; d++)
 			hb[d] = silu_f32(hb[d]) * hb2[d];
-		matmul_fp16(xb2, hb, weights + lo->down, dim, hidden_dim);
+		kernel_fpu_end();
 
-		/* 2j: Residual */
+		/* --- Tile T5: FFN down + residual --- */
+		kernel_fpu_begin();
+		matmul_fp16(xb2, hb, weights + lo->down, dim, hidden_dim);
 		for (d = 0; d < dim; d++)
 			x[d] += xb2[d];
+		kernel_fpu_end();
 
-		if (pos == 0 && (l == 0 || l == c->n_layers - 1)) {
-			pr_info("hackbot_fpu: layer %d: x[0..4] = [%d, %d, %d, %d] (x1000)\n",
-				l, (int)(x[0] * 1000), (int)(x[1] * 1000),
-				(int)(x[2] * 1000), (int)(x[3] * 1000));
-		}
+		cond_resched();
 	}
 
-	/* === Step 3: Final RMSNorm === */
+	/* === Tile T6: Final RMSNorm === */
+	kernel_fpu_begin();
 	rmsnorm_f32(xb, x, weights + st->rms_final_off, dim);
+	kernel_fpu_end();
 
-	/* === Step 4: Logits (tied embeddings) === */
-	matmul_fp16(logits_buf, xb, weights + st->embed_off,
-		    c->vocab_size, dim);
+	/*
+	 * === Tiles T7..: Logits matmul, sliced by output rows. ===
+	 *
+	 * We reuse matmul_fp16 with a row-window: each call computes
+	 * `chunk` output rows starting at row index `row_off`. The
+	 * weight pointer advances by row_off * dim * sizeof(u16).
+	 */
+	for (row_off = 0; row_off < vocab_size; row_off += LOGITS_ROWS_PER_TILE) {
+		chunk = vocab_size - row_off;
+		if (chunk > LOGITS_ROWS_PER_TILE)
+			chunk = LOGITS_ROWS_PER_TILE;
 
-	if (pos == 0) {
-		/* Find argmax for debug */
-		int best = 0;
-		for (d = 1; d < c->vocab_size; d++)
-			if (logits_buf[d] > logits_buf[best])
-				best = d;
-		pr_info("hackbot_fpu: logits[pos=0]: top1=token %d (logit=%d x1000), "
-			"logit[0]=%d, logit[1]=%d, logit[2]=%d (x1000)\n",
-			best, (int)(logits_buf[best] * 1000),
-			(int)(logits_buf[0] * 1000),
-			(int)(logits_buf[1] * 1000),
-			(int)(logits_buf[2] * 1000));
+		kernel_fpu_begin();
+		matmul_fp16(logits_buf + row_off, xb,
+			    weights + st->embed_off
+			    + (size_t)row_off * dim * sizeof(u16),
+			    chunk, dim);
+		kernel_fpu_end();
+
+		cond_resched();
 	}
 }
 
@@ -666,6 +714,12 @@ void hackbot_fpu_reset(void *state)
  *
  * Must be called from process context (sleepable).
  * Returns 0 on success.
+ *
+ * NOTE: FPU bracketing (kernel_fpu_begin/end) lives INSIDE
+ * forward_token_impl, split into per-tile windows of bounded latency.
+ * Wrapping the entire forward pass in a single FPU window held
+ * local_bh_disable for ~100 ms per token, causing visible system
+ * stutter; the tiled design keeps each window under ~1 ms.
  */
 int hackbot_fpu_forward(void *state, const void *weights,
 			size_t weights_len, int token_id, int pos)
@@ -679,9 +733,7 @@ int hackbot_fpu_forward(void *state, const void *weights,
 	if (pos < 0 || pos >= st->cfg.max_seq)
 		return -3;
 
-	kernel_fpu_begin();
 	forward_token_impl(st, (const u8 *)weights, token_id, pos);
-	kernel_fpu_end();
 
 	return 0;
 }
