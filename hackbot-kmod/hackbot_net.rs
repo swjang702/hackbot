@@ -174,7 +174,16 @@ pub(crate) fn json_escape(input: &[u8], output: &mut KVVec<u8>) {
             b'\n' => { let _ = output.extend_from_slice(b"\\n", GFP_KERNEL); }
             b'\r' => { let _ = output.extend_from_slice(b"\\r", GFP_KERNEL); }
             b'\t' => { let _ = output.extend_from_slice(b"\\t", GFP_KERNEL); }
-            c if c < 0x20 => {}
+            // RFC 8259: non-CR/LF/Tab control bytes must be emitted as
+            // `\u00XX`. Dropping them silently corrupts user prompts that
+            // happen to contain bytes like 0x01 (e.g. binary input passed
+            // through tooling). See R-022 in docs/REVIEW_v0.1.md.
+            c if c < 0x20 => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let _ = output.extend_from_slice(b"\\u00", GFP_KERNEL);
+                let _ = output.push(HEX[((c >> 4) & 0x0f) as usize], GFP_KERNEL);
+                let _ = output.push(HEX[(c & 0x0f) as usize], GFP_KERNEL);
+            }
             _ => { let _ = output.push(b, GFP_KERNEL); }
         }
     }
