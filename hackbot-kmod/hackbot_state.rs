@@ -15,6 +15,7 @@ kernel::sync::global_lock! {
         data: [0u8; MAX_RESPONSE_SIZE],
         len: 0,
         ready: false,
+        busy: false,
     };
 }
 

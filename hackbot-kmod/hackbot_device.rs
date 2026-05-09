@@ -127,6 +127,24 @@ impl MiscDevice for HackbotDev {
             return Err(EFBIG);
         }
 
+        // Enforce single-writer semantics on RESPONSE. Without this, two
+        // concurrent writers can both run process_prompt (multi-second on
+        // vLLM) and then race to update RESPONSE, leaving readers with a
+        // payload from one writer and len/ready flags from the other
+        // (see R-018 in docs/REVIEW_v0.1.md). The lock is held only for
+        // the brief check-and-set, NOT through process_prompt.
+        {
+            let mut guard = RESPONSE.lock();
+            if guard.busy {
+                return Err(EBUSY);
+            }
+            guard.busy = true;
+        }
+
+        // RAII guard ensures `busy` is cleared on every exit path
+        // (early ?, panic-style returns, or the normal Ok path).
+        let _busy_guard = BusyGuard;
+
         let mut prompt = KVVec::new();
         let len = iov.copy_from_iter_vec(&mut prompt, GFP_KERNEL)?;
 
@@ -164,5 +182,23 @@ impl MiscDevice for HackbotDev {
 impl PinnedDrop for HackbotDev {
     fn drop(self: Pin<&mut Self>) {
         dev_info!(self.dev, "hackbot: device closed\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BusyGuard: clears RESPONSE.busy on scope exit (R-018).
+// ---------------------------------------------------------------------------
+
+/// RAII helper that clears `RESPONSE.busy` when dropped.
+///
+/// Must be constructed only after `RESPONSE.busy` has been set to `true`
+/// under the RESPONSE lock. The Drop impl re-takes the lock briefly to
+/// clear the flag, so concurrent writers can again enter `write_iter`.
+struct BusyGuard;
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        let mut guard = RESPONSE.lock();
+        guard.busy = false;
     }
 }
