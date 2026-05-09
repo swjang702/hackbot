@@ -23,12 +23,13 @@
 #include <linux/sched.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
-#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/atomic.h>
 #include <linux/timekeeping.h>
 #include <linux/slab.h>
 #include <linux/log2.h>
+#include <linux/percpu.h>
+#include <linux/seqlock.h>
 #include "hackbot_trace.h"
 #include "hackbot_tokenizer.h"
 #include "hackbot_ngram.h"
@@ -76,31 +77,52 @@ struct raw_io_event {
 	u8  is_write;
 };
 
-/* --- Tier 2: Feature vectors (LinnOS-style) --- */
+/* --- Tier 2: Feature vectors (LinnOS-style)
+ *
+ * R-002: Per-CPU + seqcount_t. Single writer per CPU (probe context with
+ * IRQs disabled), many cross-CPU readers. seqcount_t (vanilla, not
+ * seqcount_spinlock_t) is correct because mutual exclusion against nested
+ * writers on the same CPU is provided by local_irq_save() — block_rq_complete
+ * fires from softirq and could otherwise re-enter on top of a process-context
+ * sys_enter on the same CPU.
+ *
+ * `seq` MUST be the first field so cross-CPU readers can access it
+ * without relying on layout details. Remaining fields zero-init from BSS.
+ */
 
 struct sched_features {
+	seqcount_t seq;
 	u32 last_switch_intervals_us[FEATURE_WINDOW];
 	u32 last_runqueue_lengths[FEATURE_WINDOW];
 	u64 last_switch_ns;           /* timestamp of previous switch */
-	u32 switches_in_window;       /* 1-second rolling count */
+	u32 switches_in_window;       /* 1-second rolling count (per-CPU) */
 	u64 window_start_ns;
 };
 
 struct syscall_features {
+	seqcount_t seq;
 	u32 last_syscall_ids[FEATURE_WINDOW];
 	u32 last_intervals_us[FEATURE_WINDOW];
 	u64 last_syscall_ns;
-	u32 syscalls_in_window;
+	u32 syscalls_in_window;       /* 1-second rolling count (per-CPU) */
 	u64 window_start_ns;
 };
 
 struct io_features {
+	seqcount_t seq;
 	u32 last_latencies_us[FEATURE_WINDOW];   /* THE key LinnOS feature */
 	u32 last_pending_ios[FEATURE_WINDOW];
 	u32 current_queue_depth;
-	u32 ios_in_window;
+	u32 ios_in_window;            /* 1-second rolling count (per-CPU) */
 	u64 window_start_ns;
 };
+
+/* Per-CPU feature vectors. Updated lock-free by the local CPU's probe
+ * (IRQ-disabled, single-writer-per-CPU); cross-CPU readers use seqcount
+ * retry loops. BSS-zero is a valid initial state. */
+static DEFINE_PER_CPU(struct sched_features, sched_pcpu);
+static DEFINE_PER_CPU(struct syscall_features, syscall_pcpu);
+static DEFINE_PER_CPU(struct io_features, io_pcpu);
 
 /* --- Tier 3: Aggregate stats --- */
 
@@ -138,25 +160,19 @@ struct hackbot_trace_state {
 	struct tracepoint *tp_sys_enter;
 	struct tracepoint *tp_block_rq_complete;
 
-	/* Sched channel */
+	/* Sched channel (feature vector lives in sched_pcpu) */
 	struct raw_sched_event *sched_ring;
 	atomic_t sched_ring_head;
-	struct sched_features sched_feat;
-	raw_spinlock_t sched_feat_lock;
 	struct sched_aggregates sched_agg;
 
-	/* Syscall channel */
+	/* Syscall channel (feature vector lives in syscall_pcpu) */
 	struct raw_syscall_event *syscall_ring;
 	atomic_t syscall_ring_head;
-	struct syscall_features syscall_feat;
-	raw_spinlock_t syscall_feat_lock;
 	struct syscall_aggregates syscall_agg;
 
-	/* I/O channel */
+	/* I/O channel (feature vector lives in io_pcpu) */
 	struct raw_io_event *io_ring;
 	atomic_t io_ring_head;
-	struct io_features io_feat;
-	raw_spinlock_t io_feat_lock;
 	struct io_aggregates io_agg;
 
 	/* Metadata */
@@ -192,6 +208,7 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 	unsigned int idx;
 	unsigned long flags;
 	u32 interval_us;
+	struct sched_features *p;
 
 	/* Tier 1: Raw ring buffer */
 	idx = (unsigned int)atomic_inc_return(&s->sched_ring_head)
@@ -204,21 +221,26 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 	memcpy(s->sched_ring[idx].prev_comm, prev->comm, 16);
 	memcpy(s->sched_ring[idx].next_comm, next->comm, 16);
 
-	/* Tier 2: Feature vector */
-	raw_spin_lock_irqsave(&s->sched_feat_lock, flags);
-	if (s->sched_feat.last_switch_ns) {
-		interval_us = (u32)((now - s->sched_feat.last_switch_ns) / 1000);
-		shift_u32_window(s->sched_feat.last_switch_intervals_us,
+	/* Tier 2: Feature vector (per-CPU, seqcount-protected).
+	 * IRQ-disable blocks softirq re-entry from block_rq_complete on the
+	 * same CPU; preempt is already disabled by tracepoint context, so
+	 * this CPU is the only writer to its own slot. */
+	local_irq_save(flags);
+	p = this_cpu_ptr(&sched_pcpu);
+	write_seqcount_begin(&p->seq);
+	if (p->last_switch_ns) {
+		interval_us = (u32)((now - p->last_switch_ns) / 1000);
+		shift_u32_window(p->last_switch_intervals_us,
 				 FEATURE_WINDOW, interval_us);
 	}
-	s->sched_feat.last_switch_ns = now;
-	s->sched_feat.switches_in_window++;
-	/* Reset 1-second window */
-	if (now - s->sched_feat.window_start_ns > 1000000000ULL) {
-		s->sched_feat.switches_in_window = 1;
-		s->sched_feat.window_start_ns = now;
+	p->last_switch_ns = now;
+	p->switches_in_window++;
+	if (now - p->window_start_ns > 1000000000ULL) {
+		p->switches_in_window = 1;
+		p->window_start_ns = now;
 	}
-	raw_spin_unlock_irqrestore(&s->sched_feat_lock, flags);
+	write_seqcount_end(&p->seq);
+	local_irq_restore(flags);
 
 	/* Tier 3: Aggregates */
 	atomic64_inc(&s->sched_agg.total);
@@ -273,6 +295,7 @@ static void hackbot_probe_sys_enter(void *data, struct pt_regs *regs, long id)
 	unsigned int idx;
 	unsigned long flags;
 	u32 interval_us;
+	struct syscall_features *p;
 
 	/* Tier 1: Raw ring */
 	idx = (unsigned int)atomic_inc_return(&s->syscall_ring_head)
@@ -283,22 +306,24 @@ static void hackbot_probe_sys_enter(void *data, struct pt_regs *regs, long id)
 	s->syscall_ring[idx].syscall_id = id;
 	memcpy(s->syscall_ring[idx].comm, current->comm, 16);
 
-	/* Tier 2: Features */
-	raw_spin_lock_irqsave(&s->syscall_feat_lock, flags);
-	if (s->syscall_feat.last_syscall_ns) {
-		interval_us = (u32)((now - s->syscall_feat.last_syscall_ns) / 1000);
-		shift_u32_window(s->syscall_feat.last_intervals_us,
+	/* Tier 2: Features (per-CPU, seqcount-protected). */
+	local_irq_save(flags);
+	p = this_cpu_ptr(&syscall_pcpu);
+	write_seqcount_begin(&p->seq);
+	if (p->last_syscall_ns) {
+		interval_us = (u32)((now - p->last_syscall_ns) / 1000);
+		shift_u32_window(p->last_intervals_us,
 				 FEATURE_WINDOW, interval_us);
 	}
-	shift_u32_window(s->syscall_feat.last_syscall_ids,
-			 FEATURE_WINDOW, (u32)id);
-	s->syscall_feat.last_syscall_ns = now;
-	s->syscall_feat.syscalls_in_window++;
-	if (now - s->syscall_feat.window_start_ns > 1000000000ULL) {
-		s->syscall_feat.syscalls_in_window = 1;
-		s->syscall_feat.window_start_ns = now;
+	shift_u32_window(p->last_syscall_ids, FEATURE_WINDOW, (u32)id);
+	p->last_syscall_ns = now;
+	p->syscalls_in_window++;
+	if (now - p->window_start_ns > 1000000000ULL) {
+		p->syscalls_in_window = 1;
+		p->window_start_ns = now;
 	}
-	raw_spin_unlock_irqrestore(&s->syscall_feat_lock, flags);
+	write_seqcount_end(&p->seq);
+	local_irq_restore(flags);
 
 	/* Tier 3: Aggregates */
 	atomic64_inc(&s->syscall_agg.total);
@@ -321,6 +346,7 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 	unsigned long flags;
 	u32 latency_us;
 	int bucket;
+	struct io_features *p;
 
 	/* Compute I/O latency from request start time.
 	 * rq->start_time_ns uses ktime_get_ns() (adjusted monotonic),
@@ -340,15 +366,21 @@ static void hackbot_probe_block_rq_complete(void *data, struct request *rq,
 	s->io_ring[idx].error = blk_status_to_errno(error);
 	s->io_ring[idx].is_write = op_is_write(req_op(rq)) ? 1 : 0;
 
-	/* Tier 2: Features */
-	raw_spin_lock_irqsave(&s->io_feat_lock, flags);
-	shift_u32_window(s->io_feat.last_latencies_us, FEATURE_WINDOW, latency_us);
-	s->io_feat.ios_in_window++;
-	if (now - s->io_feat.window_start_ns > 1000000000ULL) {
-		s->io_feat.ios_in_window = 1;
-		s->io_feat.window_start_ns = now;
+	/* Tier 2: Features (per-CPU, seqcount-protected).
+	 * block_rq_complete fires from softirq; local_irq_save ensures we
+	 * are not interrupted on this CPU mid-update by, e.g., another
+	 * softirq raising the same CPU's queue. */
+	local_irq_save(flags);
+	p = this_cpu_ptr(&io_pcpu);
+	write_seqcount_begin(&p->seq);
+	shift_u32_window(p->last_latencies_us, FEATURE_WINDOW, latency_us);
+	p->ios_in_window++;
+	if (now - p->window_start_ns > 1000000000ULL) {
+		p->ios_in_window = 1;
+		p->window_start_ns = now;
 	}
-	raw_spin_unlock_irqrestore(&s->io_feat_lock, flags);
+	write_seqcount_end(&p->seq);
+	local_irq_restore(flags);
 
 	/* Tier 3: Aggregates */
 	atomic64_inc(&s->io_agg.total);
@@ -430,8 +462,8 @@ int hackbot_trace_read_sched(char *out, int maxlen)
 	struct hackbot_trace_state *s = trace_state;
 	int pos = 0;
 	long long total, uptime_s;
-	unsigned long flags;
-	int i, n;
+	int i, n, cpu;
+	u32 total_rate = 0;
 
 	if (!s || !s->active) {
 		pos = append_str(out, pos, maxlen, "[Trace not active]\n");
@@ -474,17 +506,43 @@ int hackbot_trace_read_sched(char *out, int maxlen)
 		pos = append_str(out, pos, maxlen, "\n");
 	}
 
-	/* Features */
-	raw_spin_lock_irqsave(&s->sched_feat_lock, flags);
-	pos = append_str(out, pos, maxlen, "Features: intervals=[");
-	for (i = 0; i < FEATURE_WINDOW; i++) {
-		if (i > 0) pos = append_str(out, pos, maxlen, ",");
-		pos = append_num(out, pos, maxlen, s->sched_feat.last_switch_intervals_us[i]);
+	/* Features: per-CPU rows. The 4-element interval window is per-CPU
+	 * by design (cross-CPU temporal ordering is undefined, so we don't
+	 * concatenate). Rate is summed across CPUs. */
+	pos = append_str(out, pos, maxlen, "Features (per-CPU):\n");
+	for_each_possible_cpu(cpu) {
+		struct sched_features *p = per_cpu_ptr(&sched_pcpu, cpu);
+		struct sched_features local;
+		unsigned int seq;
+
+		do {
+			seq = read_seqcount_begin(&p->seq);
+			memcpy(&local, p, sizeof(local));
+		} while (read_seqcount_retry(&p->seq, seq));
+
+		total_rate += local.switches_in_window;
+
+		/* Suppress empty CPUs to keep output bounded. */
+		if (local.last_switch_ns == 0 && local.switches_in_window == 0)
+			continue;
+
+		pos = append_str(out, pos, maxlen, "  CPU");
+		pos = append_num(out, pos, maxlen, cpu);
+		pos = append_str(out, pos, maxlen, ": intervals=[");
+		for (i = 0; i < FEATURE_WINDOW; i++) {
+			if (i > 0) pos = append_str(out, pos, maxlen, ",");
+			pos = append_num(out, pos, maxlen,
+					 local.last_switch_intervals_us[i]);
+		}
+		pos = append_str(out, pos, maxlen, "]us rate=");
+		pos = append_num(out, pos, maxlen, local.switches_in_window);
+		pos = append_str(out, pos, maxlen, "/s\n");
+		if (pos >= maxlen - 128)
+			break;
 	}
-	pos = append_str(out, pos, maxlen, "]us rate=");
-	pos = append_num(out, pos, maxlen, s->sched_feat.switches_in_window);
+	pos = append_str(out, pos, maxlen, "Total rate=");
+	pos = append_num(out, pos, maxlen, total_rate);
 	pos = append_str(out, pos, maxlen, "/s\n");
-	raw_spin_unlock_irqrestore(&s->sched_feat_lock, flags);
 
 	pos = append_str(out, pos, maxlen, "===\n");
 	return (pos > 0) ? pos : 0;
@@ -545,9 +603,9 @@ int hackbot_trace_read_sched_raw(char *out, int maxlen, int count)
 int hackbot_trace_read_syscall(char *out, int maxlen)
 {
 	struct hackbot_trace_state *s = trace_state;
-	int pos = 0, i;
+	int pos = 0, i, cpu;
 	long long total;
-	unsigned long flags;
+	u32 total_rate = 0;
 
 	if (!s || !s->active) {
 		pos = append_str(out, pos, maxlen, "[Trace not active]\n");
@@ -573,20 +631,46 @@ int hackbot_trace_read_syscall(char *out, int maxlen)
 	}
 	pos = append_str(out, pos, maxlen, "\n");
 
-	/* Features */
-	raw_spin_lock_irqsave(&s->syscall_feat_lock, flags);
-	pos = append_str(out, pos, maxlen, "Features: ids=[");
-	for (i = 0; i < FEATURE_WINDOW; i++) {
-		if (i > 0) pos = append_str(out, pos, maxlen, ",");
-		pos = append_num(out, pos, maxlen, s->syscall_feat.last_syscall_ids[i]);
+	/* Features: per-CPU rows. */
+	pos = append_str(out, pos, maxlen, "Features (per-CPU):\n");
+	for_each_possible_cpu(cpu) {
+		struct syscall_features *p = per_cpu_ptr(&syscall_pcpu, cpu);
+		struct syscall_features local;
+		unsigned int seq;
+
+		do {
+			seq = read_seqcount_begin(&p->seq);
+			memcpy(&local, p, sizeof(local));
+		} while (read_seqcount_retry(&p->seq, seq));
+
+		total_rate += local.syscalls_in_window;
+
+		if (local.last_syscall_ns == 0 && local.syscalls_in_window == 0)
+			continue;
+
+		pos = append_str(out, pos, maxlen, "  CPU");
+		pos = append_num(out, pos, maxlen, cpu);
+		pos = append_str(out, pos, maxlen, ": ids=[");
+		for (i = 0; i < FEATURE_WINDOW; i++) {
+			if (i > 0) pos = append_str(out, pos, maxlen, ",");
+			pos = append_num(out, pos, maxlen,
+					 local.last_syscall_ids[i]);
+		}
+		pos = append_str(out, pos, maxlen, "] intervals=[");
+		for (i = 0; i < FEATURE_WINDOW; i++) {
+			if (i > 0) pos = append_str(out, pos, maxlen, ",");
+			pos = append_num(out, pos, maxlen,
+					 local.last_intervals_us[i]);
+		}
+		pos = append_str(out, pos, maxlen, "]us rate=");
+		pos = append_num(out, pos, maxlen, local.syscalls_in_window);
+		pos = append_str(out, pos, maxlen, "/s\n");
+		if (pos >= maxlen - 128)
+			break;
 	}
-	pos = append_str(out, pos, maxlen, "] intervals=[");
-	for (i = 0; i < FEATURE_WINDOW; i++) {
-		if (i > 0) pos = append_str(out, pos, maxlen, ",");
-		pos = append_num(out, pos, maxlen, s->syscall_feat.last_intervals_us[i]);
-	}
-	pos = append_str(out, pos, maxlen, "]us\n");
-	raw_spin_unlock_irqrestore(&s->syscall_feat_lock, flags);
+	pos = append_str(out, pos, maxlen, "Total rate=");
+	pos = append_num(out, pos, maxlen, total_rate);
+	pos = append_str(out, pos, maxlen, "/s\n");
 
 	pos = append_str(out, pos, maxlen, "===\n");
 	return (pos > 0) ? pos : 0;
@@ -631,9 +715,9 @@ int hackbot_trace_read_syscall_raw(char *out, int maxlen, int count)
 int hackbot_trace_read_io(char *out, int maxlen)
 {
 	struct hackbot_trace_state *s = trace_state;
-	int pos = 0, i;
+	int pos = 0, i, cpu;
 	long long total, total_lat;
-	unsigned long flags;
+	u32 total_rate = 0;
 	static const char *bucket_names[] = {
 		"<100us", "<500us", "<1ms", "<5ms",
 		"<10ms", "<50ms", "<100ms", ">100ms"
@@ -670,15 +754,40 @@ int hackbot_trace_read_io(char *out, int maxlen)
 	}
 	pos = append_str(out, pos, maxlen, "\n");
 
-	/* Features */
-	raw_spin_lock_irqsave(&s->io_feat_lock, flags);
-	pos = append_str(out, pos, maxlen, "Features: lats=[");
-	for (i = 0; i < FEATURE_WINDOW; i++) {
-		if (i > 0) pos = append_str(out, pos, maxlen, ",");
-		pos = append_num(out, pos, maxlen, s->io_feat.last_latencies_us[i]);
+	/* Features: per-CPU rows. */
+	pos = append_str(out, pos, maxlen, "Features (per-CPU):\n");
+	for_each_possible_cpu(cpu) {
+		struct io_features *p = per_cpu_ptr(&io_pcpu, cpu);
+		struct io_features local;
+		unsigned int seq;
+
+		do {
+			seq = read_seqcount_begin(&p->seq);
+			memcpy(&local, p, sizeof(local));
+		} while (read_seqcount_retry(&p->seq, seq));
+
+		total_rate += local.ios_in_window;
+
+		if (local.ios_in_window == 0 && local.window_start_ns == 0)
+			continue;
+
+		pos = append_str(out, pos, maxlen, "  CPU");
+		pos = append_num(out, pos, maxlen, cpu);
+		pos = append_str(out, pos, maxlen, ": lats=[");
+		for (i = 0; i < FEATURE_WINDOW; i++) {
+			if (i > 0) pos = append_str(out, pos, maxlen, ",");
+			pos = append_num(out, pos, maxlen,
+					 local.last_latencies_us[i]);
+		}
+		pos = append_str(out, pos, maxlen, "]us rate=");
+		pos = append_num(out, pos, maxlen, local.ios_in_window);
+		pos = append_str(out, pos, maxlen, "/s\n");
+		if (pos >= maxlen - 128)
+			break;
 	}
-	pos = append_str(out, pos, maxlen, "]us\n");
-	raw_spin_unlock_irqrestore(&s->io_feat_lock, flags);
+	pos = append_str(out, pos, maxlen, "Total rate=");
+	pos = append_num(out, pos, maxlen, total_rate);
+	pos = append_str(out, pos, maxlen, "/s\n");
 
 	pos = append_str(out, pos, maxlen, "===\n");
 	return (pos > 0) ? pos : 0;
@@ -763,7 +872,7 @@ int hackbot_trace_read_ngram_alerts(char *out, int maxlen, int count)
 int hackbot_trace_init(void)
 {
 	struct hackbot_trace_state *s;
-	int ret;
+	int ret, cpu;
 
 	/* Ring index masking below assumes RAW_RING_SIZE is a power of two. */
 	BUILD_BUG_ON(!is_power_of_2(RAW_RING_SIZE));
@@ -787,9 +896,13 @@ int hackbot_trace_init(void)
 	memset(s->syscall_ring, 0, sizeof(struct raw_syscall_event) * RAW_RING_SIZE);
 	memset(s->io_ring, 0, sizeof(struct raw_io_event) * RAW_RING_SIZE);
 
-	raw_spin_lock_init(&s->sched_feat_lock);
-	raw_spin_lock_init(&s->syscall_feat_lock);
-	raw_spin_lock_init(&s->io_feat_lock);
+	/* Initialize per-CPU feature seqcounts BEFORE any tracepoint
+	 * callback can run. Other fields are BSS-zero. */
+	for_each_possible_cpu(cpu) {
+		seqcount_init(&per_cpu_ptr(&sched_pcpu, cpu)->seq);
+		seqcount_init(&per_cpu_ptr(&syscall_pcpu, cpu)->seq);
+		seqcount_init(&per_cpu_ptr(&io_pcpu, cpu)->seq);
+	}
 
 	s->start_ns = ktime_get_raw_fast_ns();
 	s->reset_ns = s->start_ns;
