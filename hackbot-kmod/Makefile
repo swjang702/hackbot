@@ -55,6 +55,13 @@ check-all: check check-warn
 	@echo "=== All checks passed ==="
 
 # Verify the build kernel has safety configs enabled (KASAN, UBSAN, etc.).
+#
+# Two-pass check:
+#   1) Single options that must each be set (parent switches + lockdep etc.).
+#   2) OR-groups: at least one option in each group must be set, where the
+#      group represents "any backend implementation" of an instrumentation
+#      framework. CONFIG_KASAN=y without one of *_GENERIC/_SW_TAGS/_HW_TAGS
+#      compiles cleanly but yields zero instrumentation.
 check-kconfig:
 	@echo "=== Kernel Safety Config Check ($(KDIR)) ==="
 	@KCONFIG="$(KDIR)/.config"; \
@@ -64,7 +71,7 @@ check-kconfig:
 		exit 1; \
 	fi; \
 	PASS=0; FAIL=0; \
-	for cfg in CONFIG_KASAN CONFIG_UBSAN CONFIG_KCSAN CONFIG_LOCKDEP \
+	for cfg in CONFIG_DEBUG_KERNEL CONFIG_KASAN CONFIG_UBSAN CONFIG_KCSAN CONFIG_LOCKDEP \
 	           CONFIG_PROVE_LOCKING CONFIG_DEBUG_ATOMIC_SLEEP \
 	           CONFIG_FORTIFY_SOURCE CONFIG_SCHED_STACK_END_CHECK; do \
 		if grep -q "^$$cfg=y" "$$KCONFIG" 2>/dev/null; then \
@@ -75,12 +82,34 @@ check-kconfig:
 			FAIL=$$((FAIL + 1)); \
 		fi; \
 	done; \
+	echo "--- backend OR-groups ---"; \
+	for group in \
+	    "KASAN backend|CONFIG_KASAN_GENERIC CONFIG_KASAN_SW_TAGS CONFIG_KASAN_HW_TAGS" \
+	    "UBSAN backend|CONFIG_UBSAN_BOUNDS CONFIG_UBSAN_SHIFT CONFIG_UBSAN_DIV_ZERO CONFIG_UBSAN_UNREACHABLE"; do \
+		label=$${group%%|*}; \
+		members=$${group##*|}; \
+		hit=""; \
+		for m in $$members; do \
+			if grep -q "^$$m=y" "$$KCONFIG" 2>/dev/null; then \
+				hit="$$m"; break; \
+			fi; \
+		done; \
+		if [ -n "$$hit" ]; then \
+			printf "  [OK]   %s: %s\n" "$$label" "$$hit"; \
+			PASS=$$((PASS + 1)); \
+		else \
+			printf "  [MISS] %s (need one of: %s)\n" "$$label" "$$members"; \
+			FAIL=$$((FAIL + 1)); \
+		fi; \
+	done; \
 	echo "---"; \
 	echo "$$PASS enabled, $$FAIL missing"; \
 	if [ $$FAIL -gt 0 ]; then \
 		echo "Tip: enable missing configs in kernel .config for full safety coverage."; \
 		echo "  KASAN  = array OOB, use-after-free    UBSAN  = integer overflow, UB"; \
 		echo "  KCSAN  = data races (lockless code)    LOCKDEP = sleep-under-spinlock"; \
+		echo "  Note: parent CONFIG_KASAN=y / CONFIG_UBSAN=y is INERT without a"; \
+		echo "        backend sub-option from the OR-groups above."; \
 	fi
 
 load:
