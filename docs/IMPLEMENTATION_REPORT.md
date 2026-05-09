@@ -1014,3 +1014,203 @@ Each tracepoint callback (~100ns, preemption disabled) updates three data struct
 - `hackbot_device.rs` — `hackbot_trace_init/exit()` in module lifecycle
 - `Kbuild` — Added `hackbot_trace.o`
 - `TESTING.md` — Comprehensive trace testing guide (Section 8)
+
+---
+
+## Source layout: monolith split (2026-03-29)
+
+The 3.7k-line `hackbot.rs` monolith from Steps 2a–2c was split into a 14-module
+tree rooted at `hackbot_main.rs` (commit `7b133f0`). Each submodule lives in its
+own file (`hackbot_config.rs`, `hackbot_state.rs`, `hackbot_device.rs`,
+`hackbot_agent.rs`, `hackbot_vllm.rs`, `hackbot_forward.rs`, `hackbot_math.rs`,
+`hackbot_model.rs`, `hackbot_tokenizer.rs`, `hackbot_tools.rs`,
+`hackbot_context.rs`, `hackbot_net.rs`, `hackbot_types.rs`, `hackbot_memory.rs`)
+and is included via a `#[path]` attribute in `hackbot_main.rs`. References to
+`hackbot.rs` in earlier sections of this report are historical — the file was
+removed entirely as part of v0.1 release prep (the modules above are
+authoritative).
+
+---
+
+## Step 2h: Config Consolidation, I/O Latency Clock Fix, Context-Overflow Reduction
+
+**Status**: Complete
+**Date**: 2026-03-31
+
+Three independent fixes folded into one step:
+
+1. **Config consolidation** — `VLLM_MAX_TOKENS` moved from a hardcoded value in
+   `hackbot_vllm.rs` into `hackbot_config.rs` so all LLM parameters live in one
+   place.
+
+2. **I/O latency clock fix** — `hackbot_trace.c` now uses `ktime_get_ns()` to
+   match the block layer's clock. Previously it used `ktime_get_raw_fast_ns()`,
+   producing ~21-minute phantom latencies due to the raw vs. adjusted-monotonic
+   clock mismatch.
+
+3. **Context-overflow reduction (small-context models)** — tuned for Qwen
+   (6976-token context window):
+   - `MAX_AGENT_ITERATIONS`: 10 → 5
+   - `MAX_TOOL_OUTPUT`: 8KB → 4KB
+   - `VLLM_MAX_TOKENS`: 4096 → 1024
+   - `TOOL_DESCRIPTION` compacted from ~900 B to ~300 B
+
+Also added a `[user]` session tag to dmesg logs to distinguish user-driven
+sessions from patrol sessions.
+
+---
+
+## Step 2i: Context-Aware Conversation Truncation
+
+**Status**: Complete
+**Date**: 2026-04-01
+
+Replaced the hard 96 KB conversation cap (which never triggered before HTTP 400
+came back from vLLM) with a sliding-window truncation strategy.
+
+When the JSON `messages` array exceeds `VLLM_CONTEXT_BUDGET` (16 KB), the array
+is rebuilt from scratch keeping only:
+
+- the system prompt
+- the original user prompt
+- the most recent tool-call / tool-output pair
+
+A truncation note is prepended so the model knows earlier context was dropped,
+and the agent can keep investigating instead of crashing on overflow. The
+budget is a constant in `hackbot_config.rs` and scales with the target
+model — bump it for larger-context models.
+
+This solved the failure mode that hit after 3–5 tool calls on the 6976-token
+Llama model.
+
+---
+
+## Step 2k: Structured Agent Memory with Tool Tracking
+
+**Status**: Complete
+**Date**: 2026-04-01
+
+The agent memory ring buffer evolved from raw text blobs into structured
+findings inspired by HyperAgents (Meta 2026). Each entry now stores:
+
+- `summary` — first sentence of the LLM response (key insight)
+- `tools_used` — comma-separated tool names accumulated during the OODA loop
+- `n_tool_calls` — investigation effort (how many tool calls)
+- `detail` — remainder of the response for additional context
+
+The OODA loop in `agent_loop_vllm()` tracks every tool name called (in a
+64-byte buffer) and passes it to `record_finding()`. The system-prompt
+injection format is enriched accordingly:
+
+```
+[+42m] (patrol) Load average elevated. httpd dominating CPU.
+  tools: ps,loadavg,trace sched | 3 calls
+```
+
+This gives the LLM visibility into *how* past findings were produced, so it
+can choose effective tool combinations and avoid repeating the same
+investigation.
+
+The default vLLM target was tuned for `Meta-Llama-3.3-70B-Instruct-AWQ-INT4`
+(commit `a802322`).
+
+---
+
+## Kernel-as-Language: Tokenizer + N-gram + Anomaly Detection
+
+**Status**: Milestones 0–2 complete
+**Date**: 2026-04-25
+**Design**: `docs/KERNEL_AS_LANGUAGE_PLAN.md`
+
+A new always-on layer that treats kernel event sequences as a language and
+flags anomalies via perplexity. Three pieces, all in C, all wired into the
+existing tracepoint callbacks.
+
+### Milestone 0 — Semantic Event Tokenizer (`hackbot_tokenizer.c/h`)
+
+Converts a raw tracepoint event into an 8-field structured token:
+`[category, action, object_type, target_class, size_class, result_class,
+duration_class, gap_class]`. Keys:
+
+- `syscall_to_action[]`: lookup mapping ~200 x86_64 syscalls → 32 action codes
+- Per-CPU gap-class tracking via `DEFINE_PER_CPU` (no false serialization
+  across cores)
+- 64-entry token ring buffer for debugging
+- ~200–400 ns per tokenization, pure integer arithmetic
+
+### Milestone 1 — N-gram Learner (`hackbot_ngram.c/h`)
+
+- 8 independent 32×32 bigram count tables (one per token field)
+- Surprise = `ilog2(row_total) - ilog2(count)` — no FPU needed
+- Dual-model: a *baseline* (long-term, never decays) + an *adaptive* model
+  whose counts halve every 10 000 events
+- Lock-free Hogwild updates: `READ_ONCE` / `WRITE_ONCE`, no spinlocks
+- Total memory ~66 KB for both models
+
+### Milestone 2 — Anomaly Detection
+
+- **Gated learning**: skip adaptive-model updates when surprise exceeds the
+  threshold, so the adaptive model can't normalize an ongoing attack
+- **Classification matrix**: NORMAL / ANOMALY / DRIFT / REGRESSION based on
+  the comparison of baseline vs. adaptive surprise
+- **Alert ring buffer** (64 entries) + waitqueue — the patrol kthread wakes on
+  alert via `wait_event_interruptible_timeout`
+- 100 ms debounce cooldown prevents alert flooding
+- 30-second grace period after init suppresses false positives at boot
+
+### Integration
+
+- Wired into all three existing tracepoint callbacks (`sched_switch`,
+  `sys_enter`, `block_rq_complete`) as Tier 4 (tokenize) and Tier 5 (n-gram)
+- New agent tool subcommands: `trace tokens`, `trace ngram`,
+  `trace ngram stats`, `trace ngram alerts`
+- Rust FFI declarations in `hackbot_types.rs`
+
+### Files added
+
+- `hackbot_tokenizer.c` (~731 lines), `hackbot_tokenizer.h`
+- `hackbot_ngram.c` (~698 lines), `hackbot_ngram.h`
+- `test_tokenizer.sh` — verification script
+
+---
+
+## Safety Hardening (April 2026)
+
+Three commits that strengthened the module against real and potential bugs.
+
+### Race & locking fixes (`046b4c9`)
+
+Four independent kernel-panic causes, all addressed at the root:
+
+- `hackbot_trace.c`: clamp `n_tasks` reads to `MAX_TRACKED_TASKS` and roll
+  back failed slot allocations — multiple CPUs racing
+  `atomic_inc_return()` in the `sched_switch` hot path could push `n_tasks`
+  above the array bound, causing later callbacks to read out of bounds.
+- (See commit body for the remaining three fixes — all root-cause, no
+  band-aids.)
+
+### Sanitizer opt-ins (`66b6b64`)
+
+`Kbuild` now opts into KASAN, UBSAN, and KCSAN at the module level. They cost
+nothing on a kernel built without them, and provide full instrumentation when
+the host kernel has them enabled. Added compiler hardening:
+
+- `-Wframe-larger-than=1024` (catch large stack frames — kernel stack is
+  8–16 KB)
+- `-Wvla` (ban variable-length arrays — stack-overflow risk)
+
+New `Makefile` safety targets:
+
+- `make check` — run sparse with `C=2`
+- `make check-warn` — `W=1` extra kernel warnings
+- `make check-all` — both
+- `make check-kconfig` — verify the host kernel has KASAN/UBSAN/KCSAN/LOCKDEP/
+  PROVE_LOCKING/DEBUG_ATOMIC_SLEEP/FORTIFY_SOURCE/SCHED_STACK_END_CHECK
+  enabled
+
+### Dead-code silenced at the source (`9e49969`)
+
+Stale `pub` items not yet wired into anything were either deleted or annotated
+with `#[allow(dead_code)]` plus a brief note explaining the reservation. Zero
+new `#[allow]` blanket suppression — every silenced warning has a justification
+in code.
