@@ -179,7 +179,12 @@ pub(crate) fn matmul_q8(
             row_acc += (group_acc * scale) >> 16;
         }
 
-        out[r] = row_acc as i32;
+        // R-017 / F-004: clamp the i64 accumulator to the i32 range before
+        // casting. A bare `as i32` truncates and turns a very large logit
+        // into low-bit noise; saturation preserves the sign and worst-case
+        // magnitude. See the saturation-policy comment in
+        // hackbot_forward.rs (post-R-017) for the rationale.
+        out[r] = row_acc.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
 }
 
