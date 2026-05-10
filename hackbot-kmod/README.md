@@ -196,4 +196,4 @@ Q16.16 precision is bounded; it accumulates error across 30 transformer layers Ã
 
 ## Status
 
-Through Step 2k of the in-kernel LLM agent track plus the kernel-as-language anomaly detection layer. See `docs/PLAN.md` and `docs/IMPLEMENTATION_REPORT.md` for full history. Step 2j (cross-subsystem anomaly demo) is the next planned milestone.
+Through Steps 2h, 2i, and 2k of the in-kernel LLM agent track plus the kernel-as-language anomaly detection layer. See `docs/PLAN.md` and `docs/IMPLEMENTATION_REPORT.md` for full history. The remaining sub-step of the Step 2 group, Step 2j (cross-subsystem anomaly demo), is the next planned milestone.
