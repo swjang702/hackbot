@@ -67,6 +67,16 @@
  */
 #define LOGITS_ROWS_PER_TILE  1024
 
+/*
+ * Sampler tile budget: number of vocab logits scanned per FPU window
+ * inside hackbot_fpu_get_next_token(). The full top-K scan over
+ * vocab_size logits (49152 for SmolLM2-135M) is otherwise a single
+ * ~2 ms FPU window — same softirq-stall class as the un-tiled forward
+ * pass fixed in R-007. 4096 logits × ~1 compare+conditional swap each
+ * runs in ~50 µs on x86_64, comfortably under the ~1 ms target.
+ */
+#define LOGITS_SAMPLER_CHUNK  4096
+
 /* ===================================================================
  * FP16 → float32 conversion (software, no SSE/AVX needed)
  * =================================================================== */
@@ -746,123 +756,173 @@ int hackbot_fpu_forward(void *state, const void *weights,
  * softmax over them, and sample from the distribution.
  *
  * Returns the selected token ID.
+ *
+ * Tile the vocab-wide scan into LOGITS_SAMPLER_CHUNK-sized FPU windows.
+ *
+ * Discipline (mirrors forward_token_impl, R-007):
+ *   - All float reads / writes (logits[], top_vals[], best_val) happen
+ *     INSIDE a kernel_fpu_begin()/kernel_fpu_end() pair.
+ *   - Integer state (top_ids[], n_top, min_idx, result) survives across
+ *     tiles on the stack.
+ *   - cond_resched() is invoked only outside FPU windows.
+ *
+ * The compile-time switch HACKBOT_TEMPERATURE == 0 selects a greedy
+ * tile body (argmax); otherwise it selects a top-K maintenance body.
+ * Final softmax + sample is one small additional tile.
  */
 int hackbot_fpu_get_next_token(const void *state)
 {
 	const struct hackbot_fpu_state *st = state;
 	int result = 0;
+	int row_off, chunk, chunk_end;
 
 	if (!st || !st->logits)
 		return 0;
 
-	kernel_fpu_begin();
-
 #if HACKBOT_TEMPERATURE == 0
-	/* Pure greedy: argmax */
 	{
-		float best_val = st->logits[0];
-		int i;
+		const int vocab_size = st->cfg.vocab_size;
+		const float *logits = st->logits;
+		float best_val;
 
-		for (i = 1; i < st->cfg.vocab_size; i++) {
-			if (st->logits[i] > best_val) {
-				best_val = st->logits[i];
-				result = i;
+		/* Seed best_val from logits[0] in a tiny FPU tile. */
+		kernel_fpu_begin();
+		best_val = logits[0];
+		kernel_fpu_end();
+
+		for (row_off = 1; row_off < vocab_size;
+		     row_off += LOGITS_SAMPLER_CHUNK) {
+			chunk_end = row_off + LOGITS_SAMPLER_CHUNK;
+			if (chunk_end > vocab_size)
+				chunk_end = vocab_size;
+
+			kernel_fpu_begin();
+			{
+				int i;
+				for (i = row_off; i < chunk_end; i++) {
+					if (logits[i] > best_val) {
+						best_val = logits[i];
+						result = i;
+					}
+				}
 			}
+			kernel_fpu_end();
+			cond_resched();
 		}
 	}
 #else
 	{
 		const float temperature = (float)HACKBOT_TEMPERATURE / 100.0f;
-		const int top_k = (HACKBOT_TOP_K > 0 && HACKBOT_TOP_K < st->cfg.vocab_size)
-				  ? HACKBOT_TOP_K : st->cfg.vocab_size;
 		const int vocab_size = st->cfg.vocab_size;
+		const int top_k = (HACKBOT_TOP_K > 0 && HACKBOT_TOP_K < vocab_size)
+				  ? HACKBOT_TOP_K : vocab_size;
 		const float *logits = st->logits;
 
-		/* Top-K candidates: (token_id, logit_value) */
+		/* Top-K candidates: (token_id, logit_value).
+		 * top_ids/n_top/min_idx are integer state — survive across tiles.
+		 * top_vals[] is float and is only read/written inside FPU windows. */
 		int   top_ids[HACKBOT_TOP_K];
 		float top_vals[HACKBOT_TOP_K];
 		int   n_top = 0;
 		int   min_idx = 0;
-		int   i, j;
-		float max_val, sum_exp, cumul, r;
-		u32   rand_val;
 
 		/*
-		 * Step 1: Find top-K logits.
-		 * Maintain a min-heap-like array: scan all logits, keeping
-		 * the K largest values seen so far.
+		 * Step 1: tiled top-K scan over vocab_size logits.
+		 *
+		 * Each chunk maintains the running top-K under a single FPU
+		 * window. The min-of-top-K linear search inside the
+		 * replacement branch stays bounded by HACKBOT_TOP_K compares,
+		 * which is dwarfed by the chunk's LOGITS_SAMPLER_CHUNK
+		 * sequential scan.
 		 */
-		for (i = 0; i < vocab_size; i++) {
-			if (n_top < top_k) {
-				/* Fill initial slots */
-				top_ids[n_top] = i;
-				top_vals[n_top] = logits[i];
-				if (n_top == 0 || logits[i] < top_vals[min_idx])
-					min_idx = n_top;
-				n_top++;
-			} else if (logits[i] > top_vals[min_idx]) {
-				/* Replace the current minimum */
-				top_ids[min_idx] = i;
-				top_vals[min_idx] = logits[i];
-				/* Find new minimum */
-				min_idx = 0;
-				for (j = 1; j < n_top; j++) {
-					if (top_vals[j] < top_vals[min_idx])
-						min_idx = j;
+		for (row_off = 0; row_off < vocab_size;
+		     row_off += LOGITS_SAMPLER_CHUNK) {
+			chunk = LOGITS_SAMPLER_CHUNK;
+			chunk_end = row_off + chunk;
+			if (chunk_end > vocab_size)
+				chunk_end = vocab_size;
+
+			kernel_fpu_begin();
+			{
+				int i, j;
+				for (i = row_off; i < chunk_end; i++) {
+					if (n_top < top_k) {
+						top_ids[n_top] = i;
+						top_vals[n_top] = logits[i];
+						if (n_top == 0 ||
+						    logits[i] < top_vals[min_idx])
+							min_idx = n_top;
+						n_top++;
+					} else if (logits[i] > top_vals[min_idx]) {
+						top_ids[min_idx] = i;
+						top_vals[min_idx] = logits[i];
+						min_idx = 0;
+						for (j = 1; j < n_top; j++) {
+							if (top_vals[j] < top_vals[min_idx])
+								min_idx = j;
+						}
+					}
+				}
+			}
+			kernel_fpu_end();
+			cond_resched();
+		}
+
+		/*
+		 * Step 2 + 3: softmax over top-K + cumulative sample, in one
+		 * small final FPU window. n_top <= HACKBOT_TOP_K (40), so the
+		 * total work is a few hundred FLOPs — well under one tile
+		 * budget.
+		 *
+		 * get_random_u32() takes its own internal locks but is safe
+		 * to call inside an FPU window: it doesn't sleep and doesn't
+		 * itself use the FPU.
+		 */
+		kernel_fpu_begin();
+		{
+			float max_val, sum_exp, cumul, r;
+			u32   rand_val;
+			int   i;
+
+			max_val = top_vals[0];
+			for (i = 1; i < n_top; i++) {
+				if (top_vals[i] > max_val)
+					max_val = top_vals[i];
+			}
+
+			sum_exp = 0.0f;
+			for (i = 0; i < n_top; i++) {
+				top_vals[i] = expf_approx(
+					(top_vals[i] - max_val) / temperature);
+				sum_exp += top_vals[i];
+			}
+
+			if (sum_exp > 0.0f) {
+				for (i = 0; i < n_top; i++)
+					top_vals[i] /= sum_exp;
+			} else {
+				/* Degenerate: uniform distribution */
+				for (i = 0; i < n_top; i++)
+					top_vals[i] = 1.0f / (float)n_top;
+			}
+
+			rand_val = get_random_u32();
+			/* Uniform in [0, 1) with 24-bit precision */
+			r = (float)(rand_val >> 8) / 16777216.0f;
+
+			cumul = 0.0f;
+			result = top_ids[0]; /* fallback */
+			for (i = 0; i < n_top; i++) {
+				cumul += top_vals[i];
+				if (r < cumul) {
+					result = top_ids[i];
+					break;
 				}
 			}
 		}
-
-		/*
-		 * Step 2: Apply temperature and compute softmax.
-		 * Scale logits by 1/temperature, subtract max for stability,
-		 * then exponentiate and normalize.
-		 */
-		max_val = top_vals[0];
-		for (i = 1; i < n_top; i++) {
-			if (top_vals[i] > max_val)
-				max_val = top_vals[i];
-		}
-
-		sum_exp = 0.0f;
-		for (i = 0; i < n_top; i++) {
-			top_vals[i] = expf_approx(
-				(top_vals[i] - max_val) / temperature);
-			sum_exp += top_vals[i];
-		}
-
-		/* Normalize to probabilities */
-		if (sum_exp > 0.0f) {
-			for (i = 0; i < n_top; i++)
-				top_vals[i] /= sum_exp;
-		} else {
-			/* Degenerate: uniform distribution */
-			for (i = 0; i < n_top; i++)
-				top_vals[i] = 1.0f / (float)n_top;
-		}
-
-		/*
-		 * Step 3: Sample from the distribution.
-		 * Generate a uniform random value in [0, 1) and walk the
-		 * cumulative distribution to find the selected token.
-		 */
-		rand_val = get_random_u32();
-		/* Convert to float in [0, 1) with 24-bit precision */
-		r = (float)(rand_val >> 8) / 16777216.0f;
-
-		cumul = 0.0f;
-		result = top_ids[0]; /* fallback */
-		for (i = 0; i < n_top; i++) {
-			cumul += top_vals[i];
-			if (r < cumul) {
-				result = top_ids[i];
-				break;
-			}
-		}
+		kernel_fpu_end();
 	}
 #endif
-
-	kernel_fpu_end();
 
 	return result;
 }
