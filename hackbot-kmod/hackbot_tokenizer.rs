@@ -1,6 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0
 
 //! GPT-2 BPE tokenizer and text generation for in-kernel inference.
+//!
+//! # Unsafe invariants (apply to every `unsafe` block in this file)
+//!
+//! - **Provenance**: `tok_offsets: *const u32` aliases the `tok_offsets_addr`
+//!   region allocated in `parse_and_store_model` for the loaded model.
+//!   `sorted: *const u32` aliases `sorted_vocab_addr` allocated in
+//!   `build_sorted_vocab`. `data: &[u8]` is constructed from `data_addr` /
+//!   `data_len`, the vmalloc'd model blob held alive by the loaded model.
+//! - **Lifetime / lock**: every entry point that exposes these pointers runs
+//!   while `MODEL.lock()` is held by the caller (see `forward::forward_token`,
+//!   `model::load_model_if_needed`); the underlying allocations are freed only
+//!   in `free_model_resources`, also under the same lock.
+//! - **Bounds**: `tok_offsets` and `sorted` each cover exactly `vocab_size`
+//!   `u32` entries (validated at parse time against the model header).
+//!   `vocab_size <= MODEL_MAX_VOCAB`. Each `tok_offsets[i]` points at a
+//!   6-byte score+length prefix that fits inside `data`, validated by the
+//!   `pos + 6 > data.len()` check in `parse_and_store_model`.
+//! - **Aliasing**: pointer reads here do not coexist with any `&mut` borrow
+//!   over the same region — the offset table and sorted index are immutable
+//!   after `build_sorted_vocab` returns; `data` is `&[u8]`.
+//!
+//! Per-block SAFETY comments below highlight only deviations or tighter
+//! sub-range bounds.
 
 use kernel::{bindings, prelude::*};
 
@@ -44,6 +67,9 @@ pub(crate) const GPT2_CODEPOINT_TO_BYTE: [u8; 324] = {
 /// Decode a token ID to its GPT-2 encoded byte representation.
 #[allow(dead_code)]
 pub(crate) fn decode_token_bytes<'a>(data: &'a [u8], tok_offsets: *const u32, token_id: usize) -> &'a [u8] {
+    // SAFETY: file-level invariants apply. Caller passes `token_id < vocab_size`
+    // (every call site iterates over `[0, vocab_size)` or over a token id that
+    // was produced by the BPE encode/decode path bounded by vocab_size).
     let off = unsafe { *tok_offsets.add(token_id) } as usize;
     let len = u16::from_le_bytes([data[off + 4], data[off + 5]]) as usize;
     &data[off + 6..off + 6 + len]
@@ -52,6 +78,9 @@ pub(crate) fn decode_token_bytes<'a>(data: &'a [u8], tok_offsets: *const u32, to
 /// Get the BPE merge score for a token.
 #[allow(dead_code)]
 pub(crate) fn get_token_score(data: &[u8], tok_offsets: *const u32, token_id: usize) -> i32 {
+    // SAFETY: file-level invariants apply. `token_id < vocab_size` is enforced
+    // by the encode_bpe merge loop which only passes ids returned by
+    // find_token_by_bytes (themselves bounded by vocab_size).
     let off = unsafe { *tok_offsets.add(token_id) } as usize;
     i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
@@ -157,6 +186,8 @@ pub(crate) fn find_token_by_bytes(
     let mut hi = vocab_size;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
+        // SAFETY: file-level invariants apply. `mid < hi <= vocab_size`,
+        // and `sorted` covers exactly vocab_size u32 entries.
         let mid_id = unsafe { *sorted.add(mid) };
         let mid_bytes = decode_token_bytes(data, tok_offsets, mid_id as usize);
         match query.cmp(mid_bytes) {
@@ -171,12 +202,19 @@ pub(crate) fn find_token_by_bytes(
 /// Build the sorted vocabulary index and byte-to-token lookup table.
 pub(crate) fn build_sorted_vocab(slot: &mut ModelSlot) -> Result {
     let vocab_size = slot.config.vocab_size as usize;
+    // SAFETY: file-level invariants apply. `data_addr`/`data_len` describe the
+    // model blob held alive by the loaded slot; caller holds MODEL.lock().
     let data = unsafe {
         core::slice::from_raw_parts(slot.data_addr as *const u8, slot.data_len)
     };
     let tok_offsets = slot.tok_offsets_addr as *const u32;
 
     let alloc_size = vocab_size * core::mem::size_of::<u32>();
+    // SAFETY: FFI to kvrealloc with NULL `old` (fresh allocation). `alloc_size`
+    // is bounded by MODEL_MAX_VOCAB * sizeof(u32) and cannot overflow usize.
+    // Alignment is the natural alignment of u32. GFP_KERNEL is legal here:
+    // build_sorted_vocab is called from load_model_if_needed in process
+    // context (firmware load handler).
     let ptr = unsafe {
         bindings::kvrealloc_node_align_noprof(
             core::ptr::null(),
@@ -192,6 +230,10 @@ pub(crate) fn build_sorted_vocab(slot: &mut ModelSlot) -> Result {
         return Err(ENOMEM);
     }
 
+    // SAFETY: `ptr` is non-null (checked above), points to `vocab_size` freshly
+    // allocated u32s we own exclusively, and is u32-aligned. The borrow is
+    // confined to the heapsort_vocab call below; no other view aliases this
+    // region during the sort.
     let sorted = unsafe { core::slice::from_raw_parts_mut(ptr, vocab_size) };
     for i in 0..vocab_size {
         sorted[i] = i as u32;
@@ -261,6 +303,8 @@ pub(crate) fn encode_bpe(slot: &ModelSlot, input: &[u8], out_tokens: &mut [u32])
         return 0;
     }
 
+    // SAFETY: file-level invariants apply. `data_addr`/`data_len` describe the
+    // model blob held alive by the loaded slot; caller holds MODEL.lock().
     let data = unsafe {
         core::slice::from_raw_parts(slot.data_addr as *const u8, slot.data_len)
     };
@@ -351,6 +395,9 @@ pub(crate) fn encode_bpe(slot: &ModelSlot, input: &[u8], out_tokens: &mut [u32])
 #[allow(dead_code)]
 pub(crate) fn get_next_token(slot: &ModelSlot) -> usize {
     if slot.format_version == MODEL_FORMAT_V2 {
+        // SAFETY: FFI to hackbot_fpu.c. `fpu_state` was returned by
+        // hackbot_fpu_alloc for this slot and is freed only on model unload
+        // under MODEL.lock(). Caller holds MODEL.lock() across this call.
         let tok = unsafe {
             hackbot_fpu_get_next_token(slot.fpu_state as *const core::ffi::c_void)
         };
@@ -360,6 +407,9 @@ pub(crate) fn get_next_token(slot: &ModelSlot) -> usize {
     let vocab_size = slot.config.vocab_size as usize;
     let mut best = 0usize;
     for i in 1..vocab_size {
+        // SAFETY: logits region is `vocab_size` i32 elements long (allocated
+        // in alloc_inference_state); both `i` and `best` are < vocab_size.
+        // Caller holds MODEL.lock(); no &mut over the inf allocation is live.
         if unsafe { *logits_ptr.add(i) > *logits_ptr.add(best) } {
             best = i;
         }
@@ -380,6 +430,8 @@ pub(crate) fn generate_from_tokens(
         return 0;
     }
 
+    // SAFETY: file-level invariants apply. `data_addr`/`data_len` describe the
+    // model blob held alive by the loaded slot; caller holds MODEL.lock().
     let data = unsafe {
         core::slice::from_raw_parts(slot.data_addr as *const u8, slot.data_len)
     };
