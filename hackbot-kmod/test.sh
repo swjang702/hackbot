@@ -343,6 +343,25 @@ test_tools() {
         "attach a kprobe to do_sys_openat2 then check hit count" \
         "kprobe\|attach\|hit\|count\|openat"
 
+    test_one_tool "loadavg" \
+        "what is the system load? use the loadavg tool" \
+        "load\|average\|cpu\|uptime"
+
+    # trace and its subcommands: pick representative ones rather than
+    # one-per. trace sched, trace io, and trace ngram stats together
+    # exercise scheduler, I/O, and the n-gram surprise paths.
+    test_one_tool "trace sched" \
+        "use the trace sched tool to show recent scheduler activity" \
+        "context\|switch\|cpu\|sched"
+
+    test_one_tool "trace io" \
+        "use the trace io tool to show I/O latency" \
+        "I/O\|latency\|histogram\|io\|read\|write"
+
+    test_one_tool "trace ngram stats" \
+        "use the trace ngram stats tool to show n-gram model statistics" \
+        "events\|perplexity\|ngram\|n-gram\|tokens"
+
     show_dmesg
     rmmod hackbot 2>/dev/null || true
     sleep 1

@@ -10,7 +10,7 @@
 #   make unload             # rmmod the module (requires sudo)
 #   make test               # quick smoke test (load → write → read → unload)
 #   make test-full           # full integration test suite
-#   make test-tools          # test all 6 tools via vLLM
+#   make test-tools          # test all tools via vLLM
 #   make test-patrol         # test patrol thread (waits ~35s)
 
 KDIR ?= $(HOME)/sources/linux-6.19.8
