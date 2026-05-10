@@ -16,11 +16,50 @@
 KDIR ?= $(HOME)/sources/linux-6.19.8
 PWD := $(shell pwd)
 
-default:
+# C sources that MUST NOT contain float math.
+# Only hackbot_fpu.c is built with -mhard-float (see Kbuild). FPU
+# instructions emitted in any other TU would execute outside
+# kernel_fpu_begin()/end() and corrupt user FPU state silently.
+NON_FPU_C := $(filter-out hackbot_fpu.c, $(wildcard hackbot_*.c))
+
+default: float-leak-check
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+# ---------------------------------------------------------------------------
+# Defensive build-time guard: refuse to build if float math leaks into a
+# non-FPU translation unit.
+#
+# Today CFLAGS_hackbot_fpu.o := -mhard-float -msse -msse2 (Kbuild) is
+# scoped per-file. If someone adds float/double/SSE intrinsics to another
+# C file in hackbot-y, those instructions execute OUTSIDE the
+# kernel_fpu_begin()/end() guard in hackbot_fpu.c and silently corrupt
+# user FPU state — no compile error, no crash, just bad floats in
+# userspace processes that happened to be running.
+#
+# This grep guards against that. The comment-line filter skips lines
+# whose contents start with '//' or '*' (single-line and continuation
+# block comments). Imperfect — a one-line '/* float */' will trip it —
+# but tight enough that legitimate type declarations stand out.
+# ---------------------------------------------------------------------------
+float-leak-check:
+	@set -e; \
+	for f in $(NON_FPU_C); do \
+		hits=$$(grep -nwE 'float|double|_mm_|__m128|__m256' $$f \
+		        | grep -vE '^[^:]*:[^:]*:[[:space:]]*(//|\*)' \
+		        || true); \
+		if [ -n "$$hits" ]; then \
+			echo "ERROR: $$f appears to contain float math:"; \
+			echo "$$hits"; \
+			echo "Only hackbot_fpu.c is built with -mhard-float; float in"; \
+			echo "another TU will execute outside kernel_fpu_begin/end and"; \
+			echo "corrupt user FPU state. Either move the float to"; \
+			echo "hackbot_fpu.c or remove it."; \
+			exit 1; \
+		fi; \
+	done
 
 # ---------------------------------------------------------------------------
 # Safety checks
@@ -160,4 +199,4 @@ test-patrol:
 	sudo bash test.sh patrol
 
 .PHONY: default clean load unload test test-full test-tools test-patrol \
-       check check-warn check-all check-kconfig
+       check check-warn check-all check-kconfig float-leak-check
