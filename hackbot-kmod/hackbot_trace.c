@@ -443,6 +443,16 @@ struct tp_lookup {
 static void find_tracepoint_cb(struct tracepoint *tp, void *priv)
 {
 	struct tp_lookup *lookup = priv;
+	/*
+	 * F-007: for_each_kernel_tracepoint in linux-6.19.8 takes a
+	 * `void (*)(struct tracepoint *, void *)` callback with no early-
+	 * out (see kernel/tracepoint.c:740). We can't stop the walk, but we
+	 * can skip the strcmp once we've already found our match — a tiny
+	 * win that compounds across init when looking up multiple
+	 * tracepoints.
+	 */
+	if (*lookup->result)
+		return;
 	if (!strcmp(tp->name, lookup->name))
 		*lookup->result = tp;
 }
