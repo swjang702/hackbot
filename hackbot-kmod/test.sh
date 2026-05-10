@@ -14,7 +14,7 @@
 #
 # Prerequisites:
 #   - hackbot.ko built (run `make` first)
-#   - vLLM server reachable at 100.66.136.70:8000 (for tool/patrol tests)
+#   - vLLM server reachable at the address in hackbot_config.rs's VLLM_ADDR (for tool/patrol tests)
 #   - Run as root
 
 # Don't use set -e — we handle errors ourselves via pass/fail.

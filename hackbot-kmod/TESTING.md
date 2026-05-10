@@ -9,7 +9,7 @@ make clean && make          # Build the module
 
 Requires:
 - Linux 6.19.8 kernel with Rust support
-- vLLM server reachable at 100.66.136.70:8000 (via Tailscale) for System 2
+- vLLM server reachable at the address specified by `VLLM_ADDR`/`VLLM_PORT` in `hackbot_config.rs` (default: keti GPU server via Tailscale) for System 2
 - Root access (sudo) for module load/unload
 
 ---
@@ -53,7 +53,7 @@ ls -la /dev/hackbot
 dmesg | grep hackbot
 # Expected:
 #   hackbot: loading module, creating /dev/hackbot
-#   hackbot: vLLM endpoint = 100.66.136.70:8000
+#   hackbot: vLLM endpoint = {VLLM_ADDR}:{VLLM_PORT}
 #   hackbot: trace: sched_switch registered
 #   hackbot: trace: sys_enter registered
 #   hackbot: trace: block_rq_complete registered
