@@ -273,7 +273,19 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 		n = (n_raw < MAX_TRACKED_TASKS) ? n_raw : MAX_TRACKED_TASKS;
 
 		for (i = 0; i < n; i++) {
-			if (s->sched_agg.tasks[i].pid == next->pid) {
+			/*
+			 * F-006: read pid with acquire ordering so that if we
+			 * see a non-zero pid, the matching comm[]/count writes
+			 * from the publisher below are also visible. A pid of
+			 * 0 means another CPU has reserved this slot via
+			 * atomic_inc_return(&n_tasks) but has not yet
+			 * published. Skip — we'll match it on the next
+			 * sched_switch for this task.
+			 */
+			s32 slot_pid = smp_load_acquire(&s->sched_agg.tasks[i].pid);
+			if (slot_pid == 0)
+				continue;
+			if (slot_pid == next->pid) {
 				atomic64_inc(&s->sched_agg.tasks[i].count);
 				return;
 			}
@@ -282,9 +294,18 @@ static void hackbot_probe_sched_switch(void *data, bool preempt,
 		if (n < MAX_TRACKED_TASKS) {
 			int slot = atomic_inc_return(&s->sched_agg.n_tasks) - 1;
 			if (slot < MAX_TRACKED_TASKS) {
-				s->sched_agg.tasks[slot].pid = next->pid;
+				/*
+				 * F-006: publish the slot's pid LAST with
+				 * release ordering. The comm and count writes
+				 * happen first; readers gating on
+				 * pid != 0 (with acquire above) will only see
+				 * the slot once those writes are visible.
+				 * comm is 16 bytes and inherently torn under a
+				 * concurrent reader without this barrier.
+				 */
 				data_race(memcpy(s->sched_agg.tasks[slot].comm, next->comm, 16));
 				atomic64_set(&s->sched_agg.tasks[slot].count, 1);
+				smp_store_release(&s->sched_agg.tasks[slot].pid, next->pid);
 			} else {
 				/* Lost race — another CPU took the last slot.
 				 * Roll back to prevent n_tasks from growing
@@ -529,12 +550,24 @@ int hackbot_trace_read_sched(char *out, int maxlen)
 		pos = append_str(out, pos, maxlen, "Top tasks:");
 		/* Simple: show first 10 tasks (not sorted — good enough for now) */
 		for (i = 0; i < n && i < 10; i++) {
-			long long cnt = atomic64_read(&s->sched_agg.tasks[i].count);
+			long long cnt;
+			/*
+			 * F-006: gate on smp_load_acquire(pid). A zero pid
+			 * means the slot has been reserved by an in-flight
+			 * publish on another CPU but the comm/count writes
+			 * are not yet visible — skip rather than print a
+			 * torn entry. Pairs with smp_store_release in
+			 * hackbot_probe_sched_switch.
+			 */
+			s32 slot_pid = smp_load_acquire(&s->sched_agg.tasks[i].pid);
+			if (slot_pid == 0)
+				continue;
+			cnt = atomic64_read(&s->sched_agg.tasks[i].count);
 			if (cnt == 0) continue;
 			pos = append_str(out, pos, maxlen, " ");
 			pos = append_str(out, pos, maxlen, s->sched_agg.tasks[i].comm);
 			pos = append_str(out, pos, maxlen, "(");
-			pos = append_num(out, pos, maxlen, s->sched_agg.tasks[i].pid);
+			pos = append_num(out, pos, maxlen, slot_pid);
 			pos = append_str(out, pos, maxlen, ")=");
 			pos = append_num(out, pos, maxlen, cnt);
 			if (pos < 0) break;
