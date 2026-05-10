@@ -45,10 +45,21 @@ check:
 	}
 	$(MAKE) -C $(KDIR) M=$(PWD) C=2 modules
 
-# Build with extra kernel warnings (W=1).
+# Build with extra kernel warnings (W=1) and promote them to errors.
 # Catches: unused variables, missing prototypes, suspicious casts.
+#
+# KCFLAGS scopes -Werror to OUR module's translation units only — the
+# kernel's own headers are compiled by the kernel build system and are
+# unaffected. The point of this target is to fail CI when our code
+# regresses on a W=1 warning instead of letting yellow text scroll by.
+#
+# If a kernel-header warning leaks into one of our TUs and -Werror
+# promotes it to a build failure, scope the suppression tightly with
+# -Wno-error=<name> rather than blanket-disabling -Werror; e.g.:
+#   $(MAKE) -C $(KDIR) M=$(PWD) W=1 \
+#       KCFLAGS='-Werror -Wno-error=address-of-packed-member' modules
 check-warn:
-	$(MAKE) -C $(KDIR) M=$(PWD) W=1 modules
+	$(MAKE) -C $(KDIR) M=$(PWD) W=1 KCFLAGS=-Werror modules
 
 # Run both sparse and extra warnings.
 check-all: check check-warn
