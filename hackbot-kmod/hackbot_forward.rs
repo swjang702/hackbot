@@ -20,16 +20,29 @@ pub(crate) fn alloc_inference_state(slot: &mut ModelSlot) -> Result {
     // Format v2: allocate float32 inference state via C helper
     if slot.format_version == MODEL_FORMAT_V2 {
         let n_heads = slot.config.n_heads as usize;
+        // F-005: range-check every usize→i32 cast at the FFI boundary instead
+        // of relying on upstream validation. SmolLM2-class config bounds make
+        // these always succeed today, but a malformed model header that slipped
+        // past parse_model_header (e.g. a future schema change) would otherwise
+        // truncate silently into bogus i32 values.
+        let dim_i      = i32::try_from(dim).map_err(|_| EINVAL)?;
+        let hidden_i   = i32::try_from(hidden_dim).map_err(|_| EINVAL)?;
+        let n_layers_i = i32::try_from(n_layers).map_err(|_| EINVAL)?;
+        let n_heads_i  = i32::try_from(n_heads).map_err(|_| EINVAL)?;
+        let n_kv_i     = i32::try_from(n_kv_heads).map_err(|_| EINVAL)?;
+        let head_i     = i32::try_from(head_dim).map_err(|_| EINVAL)?;
+        let vocab_i    = i32::try_from(vocab_size).map_err(|_| EINVAL)?;
+        let max_seq_i  = i32::try_from(INFERENCE_MAX_SEQ).map_err(|_| EINVAL)?;
+
         // SAFETY: FFI call into hackbot_fpu.c. The C signature matches the
         // `extern "C"` declaration in hackbot_types.rs. All eight arguments
-        // are validated config dimensions converted to i32; SmolLM2-class
-        // sizes (dim<=2048, n_layers<=64, vocab<=64k) cannot overflow i32.
-        // Returns NULL on allocation failure, checked immediately below.
+        // are config dimensions range-checked to fit in i32 above. Returns
+        // NULL on allocation failure, checked immediately below.
         let ptr = unsafe {
             hackbot_fpu_alloc(
-                dim as i32, hidden_dim as i32, n_layers as i32,
-                n_heads as i32, n_kv_heads as i32, head_dim as i32,
-                vocab_size as i32, INFERENCE_MAX_SEQ as i32,
+                dim_i, hidden_i, n_layers_i,
+                n_heads_i, n_kv_i, head_i,
+                vocab_i, max_seq_i,
             )
         };
         if ptr.is_null() {
@@ -142,18 +155,24 @@ pub(crate) fn forward_token(slot: &ModelSlot, token_id: usize, pos: usize) -> Re
     if slot.format_version == MODEL_FORMAT_V2 {
         let weights = (slot.data_addr + slot.weights_off) as *const core::ffi::c_void;
         let weights_len = slot.data_len.checked_sub(slot.weights_off).ok_or(EINVAL)?;
+        // F-005: range-check the usize→i32 casts even though both are bounded
+        // upstream (token_id < vocab_size < MODEL_MAX_VOCAB; pos < INFERENCE_MAX_SEQ).
+        // try_from makes the contract explicit and catches a future widening
+        // of either bound that would silently truncate.
+        let token_i = i32::try_from(token_id).map_err(|_| EINVAL)?;
+        let pos_i   = i32::try_from(pos).map_err(|_| EINVAL)?;
         // SAFETY: FFI to hackbot_fpu.c. `fpu_state` was returned by
         // hackbot_fpu_alloc for this slot and is freed only on model unload
         // under MODEL.lock(). `weights` points into the model blob mapped at
         // slot.data_addr with at least `weights_len` valid bytes (weights_off
         // and data_len are validated at model load). token_id and pos fit in
-        // i32 (vocab_size and INFERENCE_MAX_SEQ are well below i32::MAX).
+        // i32 (range-checked above).
         // Caller holds MODEL.lock() for the entirety of the call.
         let ret = unsafe {
             hackbot_fpu_forward(
                 slot.fpu_state as *mut core::ffi::c_void,
                 weights, weights_len,
-                token_id as i32, pos as i32,
+                token_i, pos_i,
             )
         };
         if ret != 0 {
