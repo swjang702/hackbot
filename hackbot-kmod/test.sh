@@ -727,15 +727,31 @@ main() {
         memory)
             test_memory
             ;;
+        ngram)
+            test_ngram
+            ;;
+        kprobe)
+            test_kprobe_lifecycle
+            ;;
+        shutdown)
+            test_shutdown_timing
+            ;;
+        fpu)
+            test_fpu_inference
+            ;;
         full)
             test_lifecycle
             test_basic_io
             test_tools
             test_patrol
             test_memory
+            test_ngram
+            test_kprobe_lifecycle
+            test_shutdown_timing
+            test_fpu_inference
             ;;
         *)
-            echo "Usage: sudo bash test.sh [quick|tools|patrol|memory|full]"
+            echo "Usage: sudo bash test.sh [quick|tools|patrol|memory|ngram|kprobe|shutdown|fpu|full]"
             exit 1
             ;;
     esac
