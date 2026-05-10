@@ -1,6 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0
 
 //! Model firmware loading, header parsing, and resource cleanup.
+//!
+//! # Unsafe invariants (apply to every `unsafe` block in this file)
+//!
+//! - **Provenance**: `tok_ptr` is a fresh allocation from
+//!   `kvrealloc_node_align_noprof` with NULL `old`, sized to
+//!   `vocab_size * sizeof(u32)`. `data_ptr` is a fresh allocation sized to
+//!   `fw_len`. `slot.*_addr` fields hold the same pointers cast to usize and
+//!   are valid until the matching `kvfree` in the cleanup paths or in
+//!   `free_model_resources`.
+//! - **Lifetime / lock**: every entry point in this file (`load_model_if_needed`,
+//!   `free_model_resources`, `parse_and_store_model`) holds `MODEL.lock()` for
+//!   its entire duration. The model blob is owned by the slot until either a
+//!   parse failure path runs `kvfree(data_ptr)` or `free_model_resources` runs.
+//! - **Bounds**: `parse_and_store_model` validates the firmware blob byte by
+//!   byte: the magic / version / header dims are checked; `pos + 6 <= data.len()`
+//!   gates each `*tok_ptr.add(i) = pos as u32` write; weight cursor advancement
+//!   uses `*cursor > data_len` checks via `q8_ref_advance` /
+//!   `norm_ref_advance`. `vocab_size <= MODEL_MAX_VOCAB`,
+//!   `n_layers <= MODEL_MAX_LAYERS`.
+//! - **Aliasing**: `tok_ptr` is written exactly once per index `i` from a
+//!   single thread (under MODEL.lock()); no `&mut` view aliases it during the
+//!   write loop. `data_ptr` is filled by a single `copy_nonoverlapping` and
+//!   then exposed only as `&[u8]`.
+//!
+//! Per-block SAFETY comments below highlight only deviations or details
+//! specific to that call site (alignment, size argument, cleanup pairing).
 
 use kernel::{bindings, c_str, device::Device, firmware::Firmware, prelude::*};
 
@@ -155,6 +181,9 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
     }
 
     let tok_alloc_size = vocab_size * core::mem::size_of::<u32>();
+    // SAFETY: file-level invariants apply. Fresh allocation: `old` is NULL,
+    // size is bounded by MODEL_MAX_VOCAB * 4, alignment is u32's natural
+    // alignment, GFP_KERNEL is legal in firmware-load (process) context.
     let tok_ptr = unsafe {
         bindings::kvrealloc_node_align_noprof(
             core::ptr::null(),
@@ -172,10 +201,17 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
 
     for i in 0..vocab_size {
         if pos + 6 > data.len() {
+            // SAFETY: file-level invariants apply. `tok_ptr` was returned by
+            // kvrealloc above and has not been freed elsewhere; release on the
+            // error path before returning.
             unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
             pr_err!("hackbot: tokenizer truncated at token {}\n", i);
             return Err(EINVAL);
         }
+        // SAFETY: file-level invariants apply. `i < vocab_size` and `tok_ptr`
+        // points to `vocab_size` u32 entries; this single-threaded write does
+        // not race with any reader (sorted vocab is built only after parse
+        // returns Ok).
         unsafe { *tok_ptr.add(i) = pos as u32 };
         pos += 4;
         let token_len = read_u16_le(data, pos)? as usize;
@@ -184,6 +220,8 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
     }
 
     if pos > data.len() {
+        // SAFETY: cleanup of `tok_ptr` from the kvrealloc above; same rationale
+        // as the in-loop free site.
         unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
         pr_err!("hackbot: tokenizer extends past end of file\n");
         return Err(EINVAL);
@@ -215,6 +253,8 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
 
         let available = data.len().saturating_sub(weights_start);
         if available < expected {
+            // SAFETY: cleanup of `tok_ptr` allocated above; same rationale as
+            // the tokenizer-loop cleanup sites.
             unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
             pr_err!("hackbot: v2 weights truncated: need {} bytes, have {}\n",
                     expected, available);
@@ -245,11 +285,13 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
     // Format v1: INT8 weights
     let gs = config.group_size as usize;
     if dim % gs != 0 {
+        // SAFETY: cleanup of `tok_ptr`; same rationale as above.
         unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
         pr_err!("hackbot: dim {} not divisible by group_size {}\n", dim, gs);
         return Err(EINVAL);
     }
     if hidden_dim % gs != 0 {
+        // SAFETY: cleanup of `tok_ptr`; same rationale as above.
         unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
         pr_err!("hackbot: hidden_dim {} not divisible by group_size {}\n", hidden_dim, gs);
         return Err(EINVAL);
@@ -257,6 +299,7 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
 
     let embed = q8_ref_advance(&mut cursor, vocab_size, dim, gs, data.len())
         .map_err(|e| {
+            // SAFETY: cleanup of `tok_ptr`; same rationale as above.
             unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
             pr_err!("hackbot: embedding weight offset overflow\n");
             e
@@ -269,6 +312,7 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
     // docs/REVIEW_v0.1.md.
     let mut layers: KBox<[LayerRef; MODEL_MAX_LAYERS]> =
         KBox::new([LayerRef::ZERO; MODEL_MAX_LAYERS], GFP_KERNEL).map_err(|e| {
+            // SAFETY: cleanup of `tok_ptr`; same rationale as above.
             unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
             pr_err!("hackbot: failed to allocate layer scratch array\n");
             e
@@ -276,6 +320,7 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
     for l in 0..n_layers {
         let rms_att_off = norm_ref_advance(&mut cursor, dim, data.len())
             .map_err(|e| {
+                // SAFETY: cleanup of `tok_ptr`; same rationale as above.
                 unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
                 pr_err!("hackbot: layer {} rms_att overflow\n", l);
                 e
@@ -285,6 +330,8 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
             ($rows:expr, $cols:expr, $name:expr) => {
                 q8_ref_advance(&mut cursor, $rows, $cols, gs, data.len())
                     .map_err(|e| {
+                        // SAFETY: cleanup of `tok_ptr`; same rationale as
+                        // the kvfree(tok_ptr) sites above.
                         unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
                         pr_err!("hackbot: layer {} {} overflow\n", l, $name);
                         e
@@ -295,6 +342,8 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
             ($dim:expr, $name:expr) => {
                 norm_ref_advance(&mut cursor, $dim, data.len())
                     .map_err(|e| {
+                        // SAFETY: cleanup of `tok_ptr`; same rationale as
+                        // the kvfree(tok_ptr) sites above.
                         unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
                         pr_err!("hackbot: layer {} {} overflow\n", l, $name);
                         e
@@ -318,6 +367,7 @@ fn parse_and_store_model(data: &[u8], slot: &mut ModelSlot) -> Result {
 
     let rms_final_off = norm_ref_advance(&mut cursor, dim, data.len())
         .map_err(|e| {
+            // SAFETY: cleanup of `tok_ptr`; same rationale as above.
             unsafe { bindings::kvfree(tok_ptr as *const core::ffi::c_void) };
             pr_err!("hackbot: rms_final overflow\n");
             e
@@ -364,6 +414,10 @@ pub(crate) fn load_model_if_needed(dev: &Device) {
     pr_info!("hackbot: loaded firmware: {} bytes ({} MB)\n",
              fw_len, fw_len / (1024 * 1024));
 
+    // SAFETY: file-level invariants apply. Fresh allocation: `old` is NULL,
+    // size is the firmware blob length (already loaded into kernel memory by
+    // request_firmware), alignment 1 is fine for u8, GFP_KERNEL is legal in
+    // process context.
     let data_ptr = unsafe {
         bindings::kvrealloc_node_align_noprof(
             core::ptr::null(),
@@ -379,12 +433,19 @@ pub(crate) fn load_model_if_needed(dev: &Device) {
         return;
     }
 
+    // SAFETY: `data_ptr` is non-null (checked) and we just allocated `fw_len`
+    // bytes there. `fw_data.as_ptr()` is valid for `fw_len` bytes (Firmware
+    // contract). The two regions are disjoint allocations, so
+    // `copy_nonoverlapping` is correct.
     unsafe {
         core::ptr::copy_nonoverlapping(fw_data.as_ptr(), data_ptr, fw_len);
     }
 
     drop(fw);
 
+    // SAFETY: `data_ptr` is non-null, points to `fw_len` initialized bytes
+    // we own, and we hold MODEL.lock() so no other thread mutates the region.
+    // The slice borrow ends before any cleanup kvfree below.
     let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, fw_len) };
 
     match parse_and_store_model(data_slice, &mut slot) {
@@ -401,6 +462,14 @@ pub(crate) fn load_model_if_needed(dev: &Device) {
                                      slot.config.dim, slot.config.hidden_dim, slot.config.n_layers);
                         }
                         Err(_) => {
+                            // SAFETY (this and the four kvfree/hackbot_fpu_free
+                            // calls in this error path): cleanup of allocations
+                            // owned by the slot. Each pointer was returned by a
+                            // matching kvrealloc/hackbot_fpu_alloc earlier in
+                            // this function and has not yet been freed; freeing
+                            // and zeroing the slot field is the standard
+                            // ownership transfer back to the allocator.
+                            // MODEL.lock() is held throughout.
                             if slot.fpu_state != 0 {
                                 unsafe { hackbot_fpu_free(slot.fpu_state as *mut core::ffi::c_void) };
                                 slot.fpu_state = 0;
@@ -420,6 +489,10 @@ pub(crate) fn load_model_if_needed(dev: &Device) {
                     }
                 }
                 Err(_) => {
+                    // SAFETY (this and the kvfree(data_ptr) below): cleanup of
+                    // allocations owned by the slot when inference-state
+                    // allocation failed. Same rationale as the sorted-vocab
+                    // failure cleanup block above; MODEL.lock() held.
                     if slot.tok_offsets_addr != 0 {
                         unsafe { bindings::kvfree(slot.tok_offsets_addr as *const core::ffi::c_void) };
                         slot.tok_offsets_addr = 0;
@@ -432,6 +505,8 @@ pub(crate) fn load_model_if_needed(dev: &Device) {
             }
         }
         Err(_) => {
+            // SAFETY: cleanup of `data_ptr` (allocated above, never moved into
+            // slot because parse failed). MODEL.lock() held.
             unsafe { bindings::kvfree(data_ptr as *const core::ffi::c_void) };
             pr_err!("hackbot: model loading failed, local inference disabled\n");
         }
@@ -445,6 +520,12 @@ pub(crate) fn free_model_resources() {
         return;
     }
 
+    // SAFETY (this whole function): final teardown under MODEL.lock(). Each
+    // `if x != 0` gate ensures we only free pointers that were successfully
+    // allocated and stored on the slot; each kvfree/hackbot_fpu_free pairs
+    // with the matching kvrealloc/hackbot_fpu_alloc in load_model_if_needed
+    // / build_sorted_vocab / alloc_inference_state. The slot fields are
+    // zeroed after free so a subsequent reload starts from a clean state.
     if slot.data_addr != 0 {
         unsafe { bindings::kvfree(slot.data_addr as *const core::ffi::c_void) };
         slot.data_addr = 0;
