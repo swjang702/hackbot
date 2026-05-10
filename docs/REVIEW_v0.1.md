@@ -92,55 +92,60 @@ helper. All bounded. Just real.
 
 ## Findings index
 
-Sorted by file. Severity then ID within each file. `[V]` = directly verified.
+Sorted by file. Severity then ID within each file. `[V]` = directly verified
+during the review pass. **Status** = the commit that closes the finding;
+`closed` means the finding turned out to be a false alarm (no code change
+needed). All 41 are now closed; this table is the durable fix-trail.
 
-| ID | File:line | Sev | Title | Verif |
-|----|-----------|-----|-------|-------|
-| R-009 | hackbot_console.c:34-66 | P1 | `raw_spinlock` not NMI-safe; self-deadlock on NMI printk | [V] |
-| R-027 | hackbot_console.c:62 | P2 | `console_total: u32` wraps after ~4 GB log volume | [A] |
-| R-014 | hackbot_device.rs:122-140 | P1 | Unbounded user write — kvmalloc DoS | [V] |
-| R-018 | hackbot_device.rs:122-140 | P2 | Last-writer-wins race on global `RESPONSE` | [A] |
-| R-010 | hackbot_files.c:139-159 | P1 | UAF on `task->files` (no `SLAB_TYPESAFE_BY_RCU`) | [V] |
-| R-011 | hackbot_files.c:158-171 | P1 | `spin_lock(&files->file_lock)` over `fdt->max_fds` walk | [A] |
-| R-026 | hackbot_files.c:215-224 | P2 | `snprintf` return-value misuse → stack leak | [A] |
-| R-015 | hackbot_forward.rs:146-161,217-243 | P1 | Aliased `&mut [i32]` plus raw-pointer access — stacked-borrows UB | [A] |
-| R-016 | hackbot_forward.rs (file-wide) | P1 | Every `unsafe` block lacks `// SAFETY:` argument | [A] |
-| R-017 | hackbot_forward.rs:179,234,246 | P1 | Silent integer overflow in Q16.16 inner loops | [A] |
-| R-025 | hackbot_forward.rs:118-119 | P2 | `weights_len = data_len - weights_off` with no `checked_sub` | [A] |
-| R-007 | hackbot_fpu.c:670-687 | P1 | Multi-millisecond `kernel_fpu_begin/end` window | [A] |
-| R-008 | hackbot_fpu.c:389,488,507 | P1 | `pr_info` inside `kernel_fpu_begin/end` region | [A] |
-| R-006 | hackbot_kprobe.c:71-105 | P1 | `register_kprobe` slot reuse + missing blacklist guard | [A] |
-| R-024 | hackbot_kprobe.c:74-85 | P2 | Embedded NUL in symbol bypasses dedup | [A] |
-| R-039 | hackbot_kprobe.c:110,237,265 | P3 | Unrate-limited `pr_info` on agent-driven attach/detach | [A] |
-| R-029 | hackbot_model.rs:265 | P3 | 8.7 KiB on-stack `[LayerRef::ZERO; 32]` under `MODEL.lock()` | [A] |
-| R-022 | hackbot_net.rs:177 | P2 | JSON escape silently drops control chars 0x01-0x1F | [A] |
-| R-005 | hackbot_ngram.c:120-149 | P1 | Halving loop in tracepoint callback + half-Hogwild discipline | [A] |
-| R-012 | hackbot_ngram.c:660-697 | P1 | `kfree(st)` after `wake_up_all` — UAF on wait-queue head | [A] |
-| R-021 | hackbot_ngram.c (debug `pr_info`) | P2 | Debug `pr_info` from probe context | [A] |
-| R-028 | hackbot_ngram.c:235 / :394 | P2 | `last_field_surprise` write/read not coordinated | [A] |
-| R-001 | hackbot_trace.c:196,276,331,499,600,691 | P1 | Signed `%` on `atomic_inc_return` ring head — OOB after wrap | [V] |
-| R-002 | hackbot_trace.c:206,219,284,298,340,347 | P1 | Three global `raw_spinlock`s in tracepoint callbacks | [V] |
-| R-019 | hackbot_trace.c:316-328 | P2 | Bogus block-I/O latency when `rq->start_time_ns == 0` | [A] |
-| R-020 | hackbot_trace.c:807-845 | P2 | `tracepoint_probe_register` partial-init returns 0 | [A] |
-| R-028b | hackbot_trace.c:198-203 | P2 | Torn 16-byte memcpy of `task->comm` | [A] |
-| R-013 | hackbot_tools.rs:117,167-209 | P1 | Sleeping `KVVec::push(GFP_KERNEL)` under `rcu::read_lock()` | [V] |
-| R-003 | hackbot_tokenizer.c:458-479 | P1 | `pr_info` from inside `sched_switch` / `sys_enter` / `block_rq_complete` | [A] |
-| R-021b | hackbot_tokenizer.rs (debug `pr_info!`) | P2 | DEBUG logs in inference hot path | [A] |
-| R-004 | hackbot_trace.c (no `tracepoint_synchronize_unregister`) | ~~P1~~ | False alarm — already implemented at hackbot_trace.c:1006 | [V] |
-| R-023 | hackbot_vllm.rs:81,86 | P2 | `-(e.to_errno())` overflow on `i32::MIN` | [A] |
-| R-030 | test.sh (entire file) | P1 | No `dmesg` grep for `BUG:` / `KASAN:` / `KCSAN:` markers | [A] |
-| R-031 | Makefile:67-69 | P1 | `check-kconfig` checks parent options only | [A] |
-| R-032 | Makefile:95-101 | P1 | `make test` not idempotent if module already loaded | [A] |
-| R-033 | Kbuild:38-46 | P1 | `kernel_version.rs` regenerates every build | [A] |
-| R-034 | Makefile:51 | P2 | `make check-warn` ignores warnings | [A] |
-| R-035 | test.sh:283-313 | P2 | `test_tools` skips `loadavg` and `trace` | [A] |
-| R-036 | test.sh (file-wide) | P2 | No real test for n-gram / kprobe roundtrip / patrol shutdown / FPU | [A] |
-| R-037 | TESTING.md:12,56; test.sh:17 | P3 | Stale vLLM IP (100.66.136.70 vs 100.103.180.11 in code) | [A] |
-| R-038 | README.md:199 | P3 | Status line "Step 2k ... next is 2j" — non-monotonic | [A] |
-| R-040 | Kbuild:33 | P3 | No defensive guard against float math leaking to other TUs | [A] |
+| ID | File:line | Sev | Title | Verif | Status |
+|----|-----------|-----|-------|-------|--------|
+| R-009 | hackbot_console.c:34-66 | P1 | `raw_spinlock` not NMI-safe; self-deadlock on NMI printk | [V] | ✅ `c9df89f` |
+| R-027 | hackbot_console.c:62 | P2 | `console_total: u32` wraps after ~4 GB log volume | [A] | ✅ `2099772` |
+| R-014 | hackbot_device.rs:122-140 | P1 | Unbounded user write — kvmalloc DoS | [V] | ✅ `2dee094` |
+| R-018 | hackbot_device.rs:122-140 | P2 | Last-writer-wins race on global `RESPONSE` | [A] | ✅ `a333362` |
+| R-010 | hackbot_files.c:139-159 | P1 | UAF on `task->files` (no `SLAB_TYPESAFE_BY_RCU`) | [V] | ✅ `43c34c1` |
+| R-011 | hackbot_files.c:158-171 | P1 | `spin_lock(&files->file_lock)` over `fdt->max_fds` walk | [A] | ✅ `43c34c1` |
+| R-026 | hackbot_files.c:215-224 | P2 | `snprintf` return-value misuse → stack leak | [A] | ✅ `33a3f22` |
+| R-015 | hackbot_forward.rs:146-161,217-243 | P1 | Aliased `&mut [i32]` plus raw-pointer access — stacked-borrows UB | [A] | ✅ `0568956` |
+| R-016 | hackbot_forward.rs (file-wide) | P1 | Every `unsafe` block lacks `// SAFETY:` argument | [A] | ✅ `0568956` |
+| R-017 | hackbot_forward.rs:179,234,246 | P1 | Silent integer overflow in Q16.16 inner loops | [A] | ✅ `0568956` |
+| R-025 | hackbot_forward.rs:118-119 | P2 | `weights_len = data_len - weights_off` with no `checked_sub` | [A] | ✅ `726ff4e` |
+| R-007 | hackbot_fpu.c:670-687 | P1 | Multi-millisecond `kernel_fpu_begin/end` window | [A] | ✅ `698baa4` |
+| R-008 | hackbot_fpu.c:389,488,507 | P1 | `pr_info` inside `kernel_fpu_begin/end` region | [A] | ✅ `698baa4` |
+| R-006 | hackbot_kprobe.c:71-105 | P1 | `register_kprobe` slot reuse + missing blacklist guard | [A] | ✅ `7aae624` |
+| R-024 | hackbot_kprobe.c:74-85 | P2 | Embedded NUL in symbol bypasses dedup | [A] | ✅ `ffb9c81` |
+| R-039 | hackbot_kprobe.c:110,237,265 | P3 | Unrate-limited `pr_info` on agent-driven attach/detach | [A] | ✅ `696aca1` |
+| R-029 | hackbot_model.rs:265 | P3 | 8.7 KiB on-stack `[LayerRef::ZERO; 32]` under `MODEL.lock()` | [A] | ✅ `fe2d450` |
+| R-022 | hackbot_net.rs:177 | P2 | JSON escape silently drops control chars 0x01-0x1F | [A] | ✅ `02492bc` |
+| R-005 | hackbot_ngram.c:120-149 | P1 | Halving loop in tracepoint callback + half-Hogwild discipline | [A] | ✅ `11dfc77` |
+| R-012 | hackbot_ngram.c:660-697 | P1 | `kfree(st)` after `wake_up_all` — UAF on wait-queue head | [A] | ✅ `68b81e0` |
+| R-021 | hackbot_ngram.c (debug `pr_info`) | P2 | Debug `pr_info` from probe context | [A] | ✅ `f3d53b1` (via R-003) |
+| R-028 | hackbot_ngram.c:235 / :394 | P2 | `last_field_surprise` write/read not coordinated | [A] | ✅ `1e36e77` |
+| R-001 | hackbot_trace.c:196,276,331,499,600,691 | P1 | Signed `%` on `atomic_inc_return` ring head — OOB after wrap | [V] | ✅ `41d6a40` |
+| R-002 | hackbot_trace.c:206,219,284,298,340,347 | P1 | Three global `raw_spinlock`s in tracepoint callbacks | [V] | ✅ `74b4d16` |
+| R-019 | hackbot_trace.c:316-328 | P2 | Bogus block-I/O latency when `rq->start_time_ns == 0` | [A] | ✅ `7bde8bb` |
+| R-020 | hackbot_trace.c:807-845 | P2 | `tracepoint_probe_register` partial-init returns 0 | [A] | ✅ `9a1850f` |
+| R-028b | hackbot_trace.c:198-203 | P2 | Torn 16-byte memcpy of `task->comm` | [A] | ✅ `04d967d` |
+| R-013 | hackbot_tools.rs:117,167-209 | P1 | Sleeping `KVVec::push(GFP_KERNEL)` under `rcu::read_lock()` | [V] | ✅ `adc48cf` |
+| R-003 | hackbot_tokenizer.c:458-479 | P1 | `pr_info` from inside `sched_switch` / `sys_enter` / `block_rq_complete` | [A] | ✅ `f3d53b1` |
+| R-021b | hackbot_tokenizer.rs (debug `pr_info!`) | P2 | DEBUG logs in inference hot path | [A] | ✅ `c086936` |
+| R-004 | hackbot_trace.c (no `tracepoint_synchronize_unregister`) | ~~P1~~ | False alarm — already implemented at hackbot_trace.c:1006 | [V] | ✅ closed `03cf88d` |
+| R-023 | hackbot_vllm.rs:81,86 | P2 | `-(e.to_errno())` overflow on `i32::MIN` | [A] | ✅ `d0ed8ee` |
+| R-030 | test.sh (entire file) | P1 | No `dmesg` grep for `BUG:` / `KASAN:` / `KCSAN:` markers | [A] | ✅ `34b7b4b` |
+| R-031 | Makefile:67-69 | P1 | `check-kconfig` checks parent options only | [A] | ✅ `c3f70f3` |
+| R-032 | Makefile:95-101 | P1 | `make test` not idempotent if module already loaded | [A] | ✅ `2abb538` |
+| R-033 | Kbuild:38-46 | P1 | `kernel_version.rs` regenerates every build | [A] | ✅ `8eef40c` |
+| R-034 | Makefile:51 | P2 | `make check-warn` ignores warnings | [A] | ✅ `db38229` |
+| R-035 | test.sh:283-313 | P2 | `test_tools` skips `loadavg` and `trace` | [A] | ✅ `8c5be07` |
+| R-036 | test.sh (file-wide) | P2 | No real test for n-gram / kprobe roundtrip / patrol shutdown / FPU | [A] | ✅ `92f5a4e` + `8ed53ed` |
+| R-037 | TESTING.md:12,56; test.sh:17 | P3 | Stale vLLM IP (100.66.136.70 vs 100.103.180.11 in code) | [A] | ✅ `f6c5a5e` |
+| R-038 | README.md:199 | P3 | Status line "Step 2k ... next is 2j" — non-monotonic | [A] | ✅ `b96862c` |
+| R-040 | Kbuild:33 | P3 | No defensive guard against float math leaking to other TUs | [A] | ✅ `7b6cb2b` |
 
-41 rows, IDs preserved. Items in the "downgraded / speculative" appendix
-do **not** appear in the table because I judged them not actionable.
+41 rows, IDs preserved. **All findings closed** as of 2026-05-09 (40 fixed
+in code, 1 closed-no-action). Run `git log --grep='<R-ID>'` for full commit
+detail. Items in the "downgraded / speculative" appendix do not appear in
+the table because I judged them not actionable.
 
 ---
 
